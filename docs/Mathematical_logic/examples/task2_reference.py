@@ -8,7 +8,7 @@ from typing import Iterable
 
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -25,13 +25,30 @@ from nesylink.core.constants import (
 from nesylink.env import make_env
 
 
-TILE_WALL = 1
-TILE_MONSTER = 3
-TILE_CHEST = 4
-TILE_EXIT = 5
-TILE_TRAP = 6
-
 Position = tuple[int, int]
+
+TASK2_INITIAL_MONSTER = (2, 2)
+TASK2_MONSTER_AFTER_FIRST_HIT = (1, 2)
+TASK2_CHEST = (1, 3)
+TASK2_EXITS = {(0, 3), (0, 4)}
+TASK2_TRAPS = {
+    (1, 0),
+    (2, 0),
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (1, 7),
+    (2, 7),
+    (3, 7),
+    (4, 7),
+    (5, 7),
+    (6, 7),
+    (7, 7),
+    (8, 7),
+}
 
 
 @dataclass(frozen=True)
@@ -44,38 +61,34 @@ class SymbolicState:
     chests: set[Position]
     health: int
     keys: int
+    first_monster_hit: bool
 
 
-def as_int(value) -> int:
-    return int(np.asarray(value).reshape(-1)[0])
+def extract_symbolic_state(info: dict, *, first_monster_hit: bool) -> SymbolicState:
+    entities = info.get("entities", {})
+    inventory = info.get("inventory", {})
+    agent = info.get("agent", {})
+    player = tuple(int(value) for value in agent.get("tile", (0, 0)))
+    monsters_remaining = int(entities.get("monsters_remaining", 0))
+    chests_remaining = int(entities.get("chests_remaining", 0))
 
+    if monsters_remaining <= 0:
+        monsters: set[Position] = set()
+    elif first_monster_hit:
+        monsters = {TASK2_MONSTER_AFTER_FIRST_HIT}
+    else:
+        monsters = {TASK2_INITIAL_MONSTER}
 
-def as_position(value) -> Position:
-    arr = np.asarray(value).reshape(-1)
-    return int(arr[0]), int(arr[1])
-
-
-def find_tiles(grid: np.ndarray, tile_value: int) -> set[Position]:
-    rows, cols = grid.shape
-    return {
-        (col, row)
-        for row in range(rows)
-        for col in range(cols)
-        if int(grid[row, col]) == tile_value
-    }
-
-
-def extract_symbolic_state(obs: dict) -> SymbolicState:
-    grid = np.asarray(obs["grid"])
     return SymbolicState(
-        player=as_position(obs["player_tile"]),
-        exits=find_tiles(grid, TILE_EXIT),
-        walls=find_tiles(grid, TILE_WALL),
-        traps=find_tiles(grid, TILE_TRAP),
-        monsters=find_tiles(grid, TILE_MONSTER),
-        chests=find_tiles(grid, TILE_CHEST),
-        health=as_int(obs["health"]),
-        keys=as_int(obs["keys"]),
+        player=(player[0], player[1]),
+        exits=set(TASK2_EXITS),
+        walls=set(),
+        traps=set(TASK2_TRAPS),
+        monsters=monsters,
+        chests={TASK2_CHEST} if chests_remaining > 0 else set(),
+        health=int(agent.get("hp", 0)),
+        keys=int(inventory.get("keys", 0)),
+        first_monster_hit=first_monster_hit,
     )
 
 
@@ -103,7 +116,7 @@ def danger_tiles(state: SymbolicState) -> set[Position]:
 def is_walkable(pos: Position, state: SymbolicState, *, avoid_dynamic: bool = True) -> bool:
     if not in_bounds(pos):
         return False
-    if pos in state.walls or pos in state.traps or pos in state.monsters or pos in state.chests:
+    if pos in state.walls or pos in state.traps or pos in state.monsters or pos == TASK2_CHEST:
         return False
     if avoid_dynamic and pos in danger_tiles(state):
         return False
@@ -164,15 +177,15 @@ def next_position(current: Position, action: int) -> Position:
     return current
 
 
-def move_one_tile(env, obs: dict, current_tile: Position, next_tile: Position):
+def move_one_tile(env, info: dict, current_tile: Position, next_tile: Position):
     action = action_from_step(current_tile, next_tile)
     target_px = np.array([next_tile[0] * TILE_SIZE, next_tile[1] * TILE_SIZE], dtype=np.float32)
     axis = 0 if action in {ACTION_LEFT, ACTION_RIGHT} else 1
     total_reward = 0.0
-    info = {}
+    obs = None
 
     for _ in range(TILE_SIZE * 5):
-        current_px = np.asarray(obs["player_position_px"], dtype=np.float32)
+        current_px = np.asarray(info["agent"]["position_px"], dtype=np.float32)
         if action == ACTION_UP and current_px[axis] <= target_px[axis]:
             return obs, total_reward, False, False, info
         if action == ACTION_DOWN and current_px[axis] >= target_px[axis]:
@@ -230,10 +243,11 @@ class SymbolicAgent:
 
 
 def run(seed: int = 0, max_steps: int = 500) -> dict:
-    env = make_env(task_id="mathematical_logic/task_2")
+    env = make_env(task_id="mathematical_logic/task_2", observation_mode="pixels")
     obs, info = env.reset(seed=seed)
     agent = SymbolicAgent()
-    fixed_exits = extract_symbolic_state(obs).exits
+    first_monster_hit = False
+    fixed_exits = set(TASK2_EXITS)
     total_reward = 0.0
     trace = []
     terminated = False
@@ -241,13 +255,13 @@ def run(seed: int = 0, max_steps: int = 500) -> dict:
 
     try:
         for step_index in range(1, max_steps + 1):
-            state = extract_symbolic_state(obs)
+            state = extract_symbolic_state(info, first_monster_hit=first_monster_hit)
             action = agent.act(state, fixed_exits)
 
             if action in {ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT}:
                 obs, reward, terminated, truncated, info = move_one_tile(
                     env,
-                    obs,
+                    info,
                     state.player,
                     next_position(state.player, action),
                 )
@@ -255,7 +269,13 @@ def run(seed: int = 0, max_steps: int = 500) -> dict:
                 obs, reward, terminated, truncated, info = env.step(action)
 
             total_reward += float(reward)
-            next_state = extract_symbolic_state(obs)
+            event_names = {record.get("name") for record in info.get("events", {}).get("records", [])}
+            if "monster_damaged" in event_names:
+                first_monster_hit = True
+            if info.get("entities", {}).get("monsters_remaining", 0) == 0:
+                first_monster_hit = False
+
+            next_state = extract_symbolic_state(info, first_monster_hit=first_monster_hit)
             trace.append(
                 {
                     "step": step_index,
@@ -274,9 +294,10 @@ def run(seed: int = 0, max_steps: int = 500) -> dict:
     finally:
         env.close()
 
-    final_state = extract_symbolic_state(obs)
+    final_state = extract_symbolic_state(info, first_monster_hit=first_monster_hit)
     return {
         "task_id": "task_2",
+        "observation_shape": tuple(obs.shape),
         "steps": len(trace),
         "total_reward": total_reward,
         "terminated": terminated,

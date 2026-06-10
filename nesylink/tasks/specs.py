@@ -40,8 +40,8 @@ class TaskSpec:
             raise ValueError(f"task '{self.task_id}' action_repeat must be >= 1")
         if self.control_mode not in {"pixel", "grid"}:
             raise ValueError(f"task '{self.task_id}' control_mode must be 'pixel' or 'grid'")
-        if self.observation_mode not in {"full", "grid"}:
-            raise ValueError(f"task '{self.task_id}' observation_mode must be 'full' or 'grid'")
+        if self.observation_mode not in {"full", "grid", "pixels"}:
+            raise ValueError(f"task '{self.task_id}' observation_mode must be 'full', 'grid', or 'pixels'")
         if self.max_monsters is not None and self.max_monsters < 1:
             raise ValueError(f"task '{self.task_id}' max_monsters must be >= 1")
         if self.max_inventory < 1:

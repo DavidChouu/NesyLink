@@ -1,0 +1,15 @@
+default:
+  observation_mode: pixels
+  action_repeat: 1 # 你可能需要把它调大一些才能让 rl 训练稳定 🤔
+
+tasks:
+  mathematical_logic/task_1:
+    max_steps: 500
+  mathematical_logic/task_2:
+    max_steps: 500
+  mathematical_logic/task_3:
+    max_steps: 1500
+  mathematical_logic/task_4:
+    max_steps: 2000
+  mathematical_logic/task_5:
+    max_steps: 2000

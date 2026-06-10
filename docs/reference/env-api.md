@@ -41,7 +41,7 @@ Parameters:
 - `render_mode`
 - `action_repeat`
 - `control_mode`: `"pixel"` or `"grid"`; defaults to `"pixel"`
-- `observation_mode`: `"full"` or `"grid"`; defaults to `"full"`
+- `observation_mode`: `"full"`, `"grid"`, or `"pixels"`; defaults to `"full"`
 - `monster_move_periods`: monster type to environment-step period mapping for grid mode
 - `max_monsters`: fixed monster slot count override
 - `max_inventory`: fixed inventory slot count; defaults to `2`
@@ -175,6 +175,14 @@ observation keys are:
 - `monsters_tile`: `int32`, shape `(max_monsters, 2)`, padded with `[-1, -1]`
 - `monsters_active_mask`: `bool`, shape `(max_monsters,)`
 - `monsters_hp`: `int32`, shape `(max_monsters,)`, padded with `0`
+
+With `observation_mode="pixels"`, observations are raw RGB map frames:
+
+- dtype: `uint8`
+- shape: `(128, 160, 3)`
+- bounds: `[0, 255]`
+
+This mode returns only the playable map area and omits the HUD.
 
 ## Rendering
 

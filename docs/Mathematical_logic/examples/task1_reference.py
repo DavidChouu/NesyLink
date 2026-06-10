@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -41,7 +41,7 @@ def build_plan() -> list[int]:
 
 
 def run(seed: int = 0) -> dict:
-    env = make_env(task_id="mathematical_logic/task_1")
+    env = make_env(task_id="mathematical_logic/task_1", observation_mode="pixels")
     obs, info = env.reset(seed=seed)
 
     total_reward = 0.0
@@ -65,7 +65,8 @@ def run(seed: int = 0) -> dict:
         "truncated": truncated,
         "terminal_reason": info.get("terminal_reason"),
         "world_completed": info.get("game", {}).get("world_completed"),
-        "final_tile": obs["player_tile"].tolist(),
+        "final_tile": info.get("agent", {}).get("tile"),
+        "obs_shape": tuple(obs.shape),
         "events": info.get("events", {}).get("records", []),
     }
 

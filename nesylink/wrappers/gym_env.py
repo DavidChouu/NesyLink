@@ -194,6 +194,15 @@ def build_grid_observation_space(max_monster_slots: int, *, max_inventory: int =
     )
 
 
+def build_pixels_observation_space() -> spaces.Box:
+    return spaces.Box(
+        low=0,
+        high=255,
+        shape=(MAP_PIXEL_HEIGHT, MAP_PIXEL_WIDTH, 3),
+        dtype=np.uint8,
+    )
+
+
 class BaseGameEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": TARGET_FPS}
 
@@ -221,8 +230,8 @@ class BaseGameEnv(gym.Env):
             raise ValueError("action_repeat must be >= 1")
         if control_mode not in {"pixel", "grid"}:
             raise ValueError("control_mode must be 'pixel' or 'grid'")
-        if observation_mode not in {"full", "grid"}:
-            raise ValueError("observation_mode must be 'full' or 'grid'")
+        if observation_mode not in {"full", "grid", "pixels"}:
+            raise ValueError("observation_mode must be 'full', 'grid', or 'pixels'")
         if max_monsters is not None and int(max_monsters) < 1:
             raise ValueError("max_monsters must be >= 1")
         if int(max_inventory) < 1:
@@ -254,7 +263,9 @@ class BaseGameEnv(gym.Env):
             self.reward_fn.set_engine_ref(self.engine)
 
         self.action_space = spaces.Discrete(len(ACTION_LABELS))
-        if self.observation_mode == "grid":
+        if self.observation_mode == "pixels":
+            self.observation_space = build_pixels_observation_space()
+        elif self.observation_mode == "grid":
             self.observation_space = build_grid_observation_space(
                 self.engine.max_monster_slots,
                 max_inventory=self.max_inventory,
@@ -269,7 +280,7 @@ class BaseGameEnv(gym.Env):
         self,
         seed: int | None = None,
         options: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    ) -> tuple[dict[str, np.ndarray] | np.ndarray, dict[str, Any]]:
         del options
         super().reset(seed=seed)
         if seed is not None:
@@ -290,7 +301,7 @@ class BaseGameEnv(gym.Env):
             self.last_reward_info = dict(info["reward"])
         return observation, info
 
-    def step(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+    def step(self, action: int) -> tuple[dict[str, np.ndarray] | np.ndarray, float, bool, bool, dict[str, Any]]:
         assert self.action_space.contains(action), "Invalid action!"
 
         if self.engine.runtime.pending_reset and self.auto_reset_on_step:
@@ -359,7 +370,9 @@ class BaseGameEnv(gym.Env):
     def hud_lines(self) -> tuple[str, str]:
         return self.engine.hud_lines()
 
-    def _get_obs(self) -> dict[str, np.ndarray]:
+    def _get_obs(self) -> dict[str, np.ndarray] | np.ndarray:
+        if self.observation_mode == "pixels":
+            return self.render()[:MAP_PIXEL_HEIGHT, :MAP_PIXEL_WIDTH]
         if self.observation_mode == "grid":
             return build_grid_observation(
                 self.engine.runtime.room,

@@ -4,9 +4,9 @@ Human-play debugging script for NesyLink environments.
 Play the game with keyboard controls and inspect obs/info by pressing Tab.
 
 Usage:
+    # 本次数理逻辑任务只有 pixels 输出，所以无法使用 Tab 来查看 obs/info 的变化细节，但你仍然可以通过观察游戏画面来理解环境状态。
     python utils/human_play.py --task mathematical_logic/task_1
     python utils/human_play.py --task mathematical_logic/task_4
-    python utils/human_play.py --task mathematical_logic/task_1 --seed 42
 """
 
 from __future__ import annotations
@@ -222,7 +222,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Build environment
-    kwargs = dict(api="gym", render_mode="rgb_array", auto_reset_on_step=True)
+    kwargs = dict(api="gym", render_mode="rgb_array", auto_reset_on_step=True, observation_mode="pixels") # NOTE:  你可以修改 observation_mode ，可选项有 “full” “pixels” “grid”
     if args.rooms:
         env = nesylink.make_env(args.rooms, **kwargs)
     else:
