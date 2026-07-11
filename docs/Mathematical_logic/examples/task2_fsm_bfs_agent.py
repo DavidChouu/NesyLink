@@ -51,7 +51,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 Position = tuple[int, int]
@@ -142,7 +142,7 @@ class Task2FSMBFSAgent:
         """根据像素观测和允许的物品栏信息输出一个环境动作。"""
 
         self._update_inventory_progress(info)
-        vision = classify_frame(obs)
+        vision = classify_frame_cnn(obs, fallback=False)
         player = None if vision.player is None else vision.player.tile
         if player is None:
             self.queued_actions.clear()
@@ -335,11 +335,56 @@ class Task2FSMBFSAgent:
 
         if action is None:
             return ACTION_NOOP
+        align_action = self._alignment_action_for_tile_step(action, vision)
+        if align_action is not None:
+            return align_action
         repeat_count = TILE_SIZE - 1
         if self._monster_tiles(vision):
             # 有动态怪物时缩短缓存，让 agent 更频繁重新规划。
             repeat_count = min(repeat_count, 4)
         self.queued_actions.extend([action] * repeat_count)
+        return action
+
+    def _alignment_action_for_tile_step(self, action: int, vision: PixelObservation) -> int | None:
+        """Align the perpendicular pixel axis before starting a tile step.
+
+        The CNN reports the player's visual center tile. Near wall corners the
+        sprite can still overlap the adjacent collision row/column, so a direct
+        horizontal or vertical push may be blocked even when the target tile is
+        visually reachable.
+        """
+
+        if vision.player is None or action not in MOVE_ACTIONS:
+            return None
+        tile_x, tile_y = vision.player.tile
+        center_x, center_y = vision.player.center_px
+        tolerance = 0.5
+
+        if action in {ACTION_LEFT, ACTION_RIGHT}:
+            desired_y = tile_y * TILE_SIZE + TILE_SIZE * 0.5
+            if center_y < desired_y - tolerance:
+                return self._walkable_alignment_action(ACTION_DOWN, vision)
+            if center_y > desired_y + tolerance:
+                return self._walkable_alignment_action(ACTION_UP, vision)
+
+        if action in {ACTION_UP, ACTION_DOWN}:
+            desired_x = tile_x * TILE_SIZE + TILE_SIZE * 0.5
+            if center_x < desired_x - tolerance:
+                return self._walkable_alignment_action(ACTION_RIGHT, vision)
+            if center_x > desired_x + tolerance:
+                return self._walkable_alignment_action(ACTION_LEFT, vision)
+        return None
+
+    def _walkable_alignment_action(self, action: int, vision: PixelObservation) -> int | None:
+        """Return an alignment action only when that small correction is safe."""
+
+        if vision.player is None:
+            return None
+        nxt = next_position(vision.player.tile, action)
+        if not in_bounds(nxt):
+            return None
+        if not self._is_walkable(nxt, vision, allow_next_to_monster=self.phase == "to_monster"):
+            return None
         return action
 
     def _shield_action(self, action: int, vision: PixelObservation) -> int:
@@ -379,11 +424,16 @@ class Task2FSMBFSAgent:
         if self.phase == "to_chest" and vision.grid[nxt[1]][nxt[0]] == "chest":
             return action
 
+        if self.phase == "to_monster":
+            if not self._is_walkable(nxt, vision, allow_next_to_monster=True):
+                return ACTION_NOOP
+            return action
+
         if not self._is_walkable(nxt, vision):
             return ACTION_NOOP
 
         # 非打怪阶段不主动走到怪物邻域，避免 chaser 靠近时被队列带进去。
-        if self.phase != "to_monster" and distance_to_nearest(nxt, self._monster_tiles(vision)) <= 1:
+        if distance_to_nearest(nxt, self._monster_tiles(vision)) <= 1:
             return ACTION_NOOP
         return action
 

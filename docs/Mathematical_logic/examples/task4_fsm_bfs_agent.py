@@ -45,7 +45,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 # ============================================================================
@@ -171,7 +171,7 @@ class Task4Agent:
     def act(self, obs, info=None) -> int:
         """根据像素观测和允许的物品栏信息输出一个环境动作。"""
         self._update_inventory_progress(info)
-        vision = classify_frame(obs)
+        vision = classify_frame_cnn(obs, fallback=False)
         player = None if vision.player is None else vision.player.tile
         if player is None:
             return ACTION_NOOP
@@ -216,6 +216,9 @@ class Task4Agent:
                 self.move_action = None
                 self.move_attempts = 0
             else:
+                align_action = self._boundary_alignment_action(vision)
+                if align_action is not None:
+                    return self._shield_action(align_action, vision)
                 return self._shield_action(self.move_action, vision)
 
         # ---- 按 mission + phase 决策 ----
@@ -232,6 +235,35 @@ class Task4Agent:
         self.move_action = action
         self.move_attempts = 0
         return action
+
+    def _boundary_alignment_action(self, vision: PixelObservation) -> int | None:
+        """Before pushing through edge exits, align the perpendicular pixel axis.
+
+        A player can be classified into the correct tile while its sprite still
+        overlaps the neighboring wall row/column. Aligning the center prevents
+        corner collision from blocking the exit push.
+        """
+
+        if self.move_target_tile is None or self.move_action is None or vision.player is None:
+            return None
+        target_x, target_y = self.move_target_tile
+        center_x, center_y = vision.player.center_px
+        tolerance = 0.5
+
+        if target_x in {0, GRID_WIDTH - 1} and self.move_action in {ACTION_LEFT, ACTION_RIGHT}:
+            desired_y = target_y * TILE_SIZE + TILE_SIZE * 0.5
+            if center_y < desired_y - tolerance:
+                return ACTION_DOWN
+            if center_y > desired_y + tolerance:
+                return ACTION_UP
+
+        if target_y in {0, GRID_HEIGHT - 1} and self.move_action in {ACTION_UP, ACTION_DOWN}:
+            desired_x = target_x * TILE_SIZE + TILE_SIZE * 0.5
+            if center_x < desired_x - tolerance:
+                return ACTION_RIGHT
+            if center_x > desired_x + tolerance:
+                return ACTION_LEFT
+        return None
 
     # ================================================================
     # 房间切换 & 卡住处理

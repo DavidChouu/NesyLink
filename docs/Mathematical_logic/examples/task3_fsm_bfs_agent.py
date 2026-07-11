@@ -59,7 +59,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 # ============================================================================
@@ -183,7 +183,7 @@ class Task3Agent:
     def act(self, obs, info=None) -> int:
         """根据像素观测和允许的物品栏信息输出一个环境动作。"""
         self._update_inventory_progress(info)
-        vision = classify_frame(obs)
+        vision = classify_frame_cnn(obs, fallback=False)
         player = None if vision.player is None else vision.player.tile
         if player is None:
             return ACTION_NOOP

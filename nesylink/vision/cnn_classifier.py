@@ -17,7 +17,7 @@ from nesylink.vision.pixel_classifier import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_aligned.weights.pt"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_targeted_v3.weights.pt"
 PLAYER_CENTER_ADJUST_PX = (-1.5, -4.5)
 
 
@@ -34,9 +34,9 @@ def classify_frame_cnn(
 ) -> PixelObservation:
     """Use the trained TinyHybridCNN to convert a pixel frame to PixelObservation.
 
-    The CNN consumes only the rendered RGB frame. If PyTorch/model loading fails,
+    The CNN consumes only the rendered RGB frame. If PyTorch/model loading fails
     or the CNN does not detect a player, the function can fall back to the
-    deterministic palette classifier so policies keep behaving sensibly.
+    deterministic palette classifier.
     """
 
     try:
@@ -82,7 +82,7 @@ def _classify_frame_cnn(
     )
     selected_device = device or os.environ.get("NESYLINK_CNN_DEVICE", "cpu")
     tile_min_score = _float_setting("NESYLINK_CNN_TILE_THRESHOLD", tile_threshold, 0.50)
-    dynamic_min_score = _float_setting("NESYLINK_CNN_DYNAMIC_THRESHOLD", dynamic_threshold, 0.20)
+    dynamic_min_score = _float_setting("NESYLINK_CNN_DYNAMIC_THRESHOLD", dynamic_threshold, 0.50)
     player_recovery_min_score = _float_setting(
         "NESYLINK_CNN_PLAYER_RECOVERY_THRESHOLD",
         player_recovery_threshold,
@@ -121,15 +121,12 @@ def _classify_frame_cnn(
 
     tile_class_grid = tile_class_ids.numpy()
     tile_observations = _tile_observations(tile_class_grid, tile_scores.numpy(), tile_min_score)
-    palette_observation = classify_frame_pixels(map_frame)
-    tile_observations = _refine_button_tiles_with_palette(tile_observations, palette_observation)
     adjust_player_center = bool(np.any(tile_class_grid == CLASS_TO_ID["npc"]))
     entities = _entity_observations(
         dynamic_boxes,
         DYNAMIC_CLASSES,
         adjust_player_center=adjust_player_center,
     )
-    entities = _refine_dynamic_entities_with_palette(palette_observation.entities, entities)
     if not any(entity.kind == "player" for entity in entities):
         raise RuntimeError("CNN did not detect player")
 
@@ -245,62 +242,33 @@ def _entity_observations(
         best.values(),
         key=lambda item: (item.kind != "player", item.tile[1], item.tile[0], -item.confidence),
     )
+    player = next((entity for entity in entities if entity.kind == "player"), None)
+    if player is not None:
+        entities = [
+            entity
+            for entity in entities
+            if entity.kind != "monster"
+            or entity.confidence >= player.confidence
+            or (entity.tile != player.tile and _bbox_iou(entity.bbox, player.bbox) < 0.35)
+        ]
     return tuple(entities)
 
 
-def _refine_button_tiles_with_palette(
-    tile_observations: tuple[TileObservation, ...],
-    palette_observation: PixelObservation,
-) -> tuple[TileObservation, ...]:
-    palette_by_tile = {tile.tile: tile for tile in palette_observation.tiles}
-    refined: list[TileObservation] = []
-    for tile in tile_observations:
-        palette_tile = palette_by_tile.get(tile.tile)
-        palette_kind = None if palette_tile is None else palette_tile.kind
-        if palette_kind == "button":
-            refined.append(
-                TileObservation(
-                    kind="button",
-                    tile=tile.tile,
-                    confidence=palette_tile.confidence,
-                    scores={"button": palette_tile.confidence},
-                )
-            )
-        elif tile.kind == "button":
-            refined.append(
-                TileObservation(
-                    kind="floor",
-                    tile=tile.tile,
-                    confidence=tile.scores.get("floor", 0.0),
-                    scores={"floor": tile.scores.get("floor", 0.0)},
-                )
-            )
-        else:
-            refined.append(tile)
-    return tuple(refined)
-
-
-def _refine_dynamic_entities_with_palette(
-    palette_entities: tuple[EntityObservation, ...],
-    entities: tuple[EntityObservation, ...],
-) -> tuple[EntityObservation, ...]:
-    palette_player = next((entity for entity in palette_entities if entity.kind == "player"), None)
-    palette_monsters = tuple(entity for entity in palette_entities if entity.kind == "monster")
-
-    cnn_player = next((entity for entity in entities if entity.kind == "player"), None)
-    cnn_monsters = tuple(entity for entity in entities if entity.kind == "monster")
-
-    refined: list[EntityObservation] = []
-    if palette_player is not None:
-        refined.append(palette_player)
-    elif cnn_player is not None:
-        refined.append(cnn_player)
-
-    del cnn_monsters
-    refined.extend(palette_monsters)
-
-    refined.sort(key=lambda item: (item.kind != "player", item.tile[1], item.tile[0], -item.confidence))
-    return tuple(refined)
+def _bbox_iou(
+    left_box: tuple[int, int, int, int],
+    right_box: tuple[int, int, int, int],
+) -> float:
+    left = max(left_box[0], right_box[0])
+    top = max(left_box[1], right_box[1])
+    right = min(left_box[2], right_box[2])
+    bottom = min(left_box[3], right_box[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    if intersection <= 0:
+        return 0.0
+    left_area = max(0, left_box[2] - left_box[0]) * max(0, left_box[3] - left_box[1])
+    right_area = max(0, right_box[2] - right_box[0]) * max(0, right_box[3] - right_box[1])
+    union = left_area + right_area - intersection
+    return 0.0 if union <= 0 else intersection / union
 
 
 def _adjust_player_center(center: tuple[float, float]) -> tuple[float, float]:

@@ -53,7 +53,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 Position = tuple[int, int]
@@ -223,7 +223,7 @@ class Task5FSMBFSAgent:
         self.step_count += 1 # 步数加一
         self._update_inventory(info) # 更新允许的 inventory
         self._tick_recently_hit_monsters()
-        vision = classify_frame(obs) # 从像素帧识别符号状态
+        vision = classify_frame_cnn(obs, fallback=False) # 从像素帧识别符号状态
         player = None if vision.player is None else vision.player.tile
         if player is None:
             self.queued_actions.clear()
@@ -484,6 +484,10 @@ class Task5FSMBFSAgent:
             return Goal(kind="press_button", tile=button_goal)
 
         exits = self._exit_info_by_direction(vision)
+        exit_blocking_monster = self._choose_reachable_monster(player, vision, exits)
+        if exit_blocking_monster is not None and not self._is_rush_mode():
+            return Goal(kind="slay_monster", tile=exit_blocking_monster)
+
         if self.has_key:
             for direction in EXIT_DIRECTION_ORDER:
                 exit_info = exits.get(direction)
@@ -633,7 +637,12 @@ class Task5FSMBFSAgent:
         candidates: list[tuple[int, Position]] = []
         for monster in monsters:
             guards_exit = any(manhattan(monster, exit_tile) <= 2 for exit_tile in active_exits)
-            if not guards_exit:
+            blocks_corridor = any(
+                monster_blocks_exit_corridor(player, monster, exit_info.tile, direction)
+                for direction, exit_info in exits.items()
+                if direction not in memory.explored_exits and direction not in memory.failed_exits
+            )
+            if not guards_exit and not blocks_corridor:
                 continue
             adjacent = self._adjacent_targets({monster}, vision, allow_next_to_monster=True)
             path = bfs_path(
@@ -865,6 +874,12 @@ class Task5FSMBFSAgent:
 
         if self.exit_push_action is not None:
             if self._can_continue_exit_push(player, direction):
+                align_action = exit_alignment_action(player, exit_tile, direction)
+                if align_action is not None and self._alignment_step_is_safe(player, align_action, vision):
+                    self.exit_push_action = None
+                    self.pending_exit_direction = None
+                    self.exit_push_steps = 0
+                    return align_action
                 return self.exit_push_action
             self.exit_push_action = None
             self.target_exit_tile = None
@@ -889,7 +904,7 @@ class Task5FSMBFSAgent:
                 return align_action
             self.exit_push_action = DIRECTION_TO_ACTION[direction]
             self.pending_exit_direction = direction
-            self.target_exit_tile = player
+            self.target_exit_tile = exit_tile
             self.exit_push_steps = 0
             self.queued_actions.clear()
             return self.exit_push_action
@@ -1406,6 +1421,25 @@ def exit_direction(pos: Position) -> str | None:
     if col == GRID_WIDTH - 1:
         return "east"
     return None
+
+
+def monster_blocks_exit_corridor(
+    player: Position,
+    monster: Position,
+    exit_tile: Position,
+    direction: str,
+) -> bool:
+    """Return whether a monster sits in the rough corridor to a visible exit."""
+
+    if direction == "east":
+        return player[0] <= monster[0] <= exit_tile[0] and abs(monster[1] - exit_tile[1]) <= 1
+    if direction == "west":
+        return exit_tile[0] <= monster[0] <= player[0] and abs(monster[1] - exit_tile[1]) <= 1
+    if direction == "south":
+        return player[1] <= monster[1] <= exit_tile[1] and abs(monster[0] - exit_tile[0]) <= 1
+    if direction == "north":
+        return exit_tile[1] <= monster[1] <= player[1] and abs(monster[0] - exit_tile[0]) <= 1
+    return False
 
 
 def moved_room(room: RoomCoord, direction: str) -> RoomCoord:

@@ -115,10 +115,11 @@ def labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
         for x, y in EXIT_TILES.get(str(exit_cfg.get("direction", "")), []):
             labels[y, x] = CLASS_TO_ID[exit_class]
 
+    bridge_tiles = dynamic_bridge_tiles_from_room_json(payload)
     for obj in payload.get("objects", []):
         if not isinstance(obj, dict):
             continue
-        write_object_label(labels, obj)
+        write_object_label(labels, obj, bridge_tiles=bridge_tiles)
 
     spawns = payload.get("spawns", {})
     default_spawn = str(payload.get("default_spawn", "default"))
@@ -131,15 +132,15 @@ def labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
 
 def static_labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
     """Build tile labels while keeping pixel-moving entities out of the grid target."""
+    annotated_labels = annotated_tile_labels(payload)
+    if annotated_labels is not None:
+        return annotated_labels
+
     labels = np.full((GRID_HEIGHT, GRID_WIDTH), CLASS_TO_ID["floor"], dtype=np.int64)
 
-    for y, row in enumerate(payload.get("layout", [])):
-        if not isinstance(row, str):
-            continue
-        for x, value in enumerate(row[:GRID_WIDTH]):
-            if y < GRID_HEIGHT and value == "#":
-                labels[y, x] = CLASS_TO_ID["wall"]
-
+    # Match renderer layering: dynamic tiles are drawn underneath static objects.
+    # A visible chest on a bridge should therefore be learned as a chest, while
+    # traps on active bridges remain hidden by the bridge.
     for obj in payload.get("dynamic_objects", []):
         if not isinstance(obj, dict):
             continue
@@ -152,18 +153,58 @@ def static_labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
         for x, y in EXIT_TILES.get(str(exit_cfg.get("direction", "")), []):
             labels[y, x] = CLASS_TO_ID[exit_class]
 
-    dynamic_objects = [obj for obj in payload.get("dynamic_objects", []) if isinstance(obj, dict)]
-    for obj in payload.get("objects", []):
-        if not isinstance(obj, dict) or str(obj.get("kind")) == "monster":
+    for y, row in enumerate(payload.get("layout", [])):
+        if not isinstance(row, str):
             continue
-        write_object_label(labels, obj)
+        for x, value in enumerate(row[:GRID_WIDTH]):
+            if y < GRID_HEIGHT and value == "#":
+                labels[y, x] = CLASS_TO_ID["wall"]
 
-    # Dynamic bridge/gap tiles are drawn underneath exits but protect traps from rendering.
-    # Reapply them last so full-map abyss traps do not erase active bridges in the target grid.
-    for obj in dynamic_objects:
-        write_dynamic_object_labels(labels, obj)
+    bridge_tiles = dynamic_bridge_tiles_from_room_json(payload)
+    objects = [obj for obj in payload.get("objects", []) if isinstance(obj, dict)]
+    for obj in objects:
+        if str(obj.get("kind")) == "trap":
+            write_object_label(labels, obj, bridge_tiles=bridge_tiles)
+    for obj in objects:
+        if str(obj.get("kind")) in {"monster", "trap"}:
+            continue
+        write_object_label(labels, obj, bridge_tiles=bridge_tiles)
 
     return labels
+
+
+def annotated_tile_labels(payload: dict[str, Any]) -> np.ndarray | None:
+    annotations = payload.get("annotations", {})
+    if not isinstance(annotations, dict):
+        return None
+    raw_labels = annotations.get("tile_labels")
+    if not isinstance(raw_labels, list) or len(raw_labels) != GRID_HEIGHT:
+        return None
+
+    labels = np.full((GRID_HEIGHT, GRID_WIDTH), CLASS_TO_ID["floor"], dtype=np.int64)
+    for row_index, row in enumerate(raw_labels):
+        if not isinstance(row, list) or len(row) != GRID_WIDTH:
+            return None
+        for col_index, value in enumerate(row):
+            kind = str(value)
+            if kind not in CLASS_TO_ID:
+                return None
+            labels[row_index, col_index] = CLASS_TO_ID[kind]
+    overlay_visible_chests(labels, payload)
+    return labels
+
+
+def overlay_visible_chests(labels: np.ndarray, payload: dict[str, Any]) -> None:
+    """Keep visible chests above trap/abyss labels in generated annotations."""
+
+    for obj in payload.get("objects", []):
+        if not isinstance(obj, dict) or str(obj.get("kind")) != "chest":
+            continue
+        if bool(obj.get("hidden", False)):
+            continue
+        pos = obj.get("pos")
+        if valid_tile(pos):
+            labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID["chest"]
 
 
 def dynamic_targets_from_room_json(payload: dict[str, Any]) -> list[DynamicTarget]:
@@ -280,7 +321,31 @@ def dynamic_heatmap_targets(
     return heatmap, box, mask
 
 
-def write_object_label(labels: np.ndarray, obj: dict[str, Any]) -> None:
+def dynamic_bridge_tiles_from_room_json(payload: dict[str, Any]) -> set[tuple[int, int]]:
+    bridge_tiles: set[tuple[int, int]] = set()
+    for obj in payload.get("dynamic_objects", []):
+        if not isinstance(obj, dict) or str(obj.get("active_tile")) != "bridge":
+            continue
+        states = obj.get("states", {})
+        active_state = str(obj.get("initial_state", ""))
+        state = states.get(active_state) if isinstance(states, dict) else None
+        if not isinstance(state, dict):
+            continue
+        raw_tiles = state.get("tiles", [])
+        if not isinstance(raw_tiles, list):
+            continue
+        for raw_tile in raw_tiles:
+            if valid_tile(raw_tile):
+                bridge_tiles.add((int(raw_tile[0]), int(raw_tile[1])))
+    return bridge_tiles
+
+
+def write_object_label(
+    labels: np.ndarray,
+    obj: dict[str, Any],
+    *,
+    bridge_tiles: set[tuple[int, int]] | None = None,
+) -> None:
     kind = str(obj.get("kind", "unknown"))
     if kind not in CLASS_TO_ID:
         return
@@ -288,8 +353,9 @@ def write_object_label(labels: np.ndarray, obj: dict[str, Any]) -> None:
         return
     if kind == "trap":
         trap_class = trap_class_from_object(obj)
+        active_bridge_tiles = bridge_tiles or set()
         for x, y in trap_tiles_from_object(obj):
-            if ID_TO_CLASS.get(int(labels[y, x])) == "bridge":
+            if (x, y) in active_bridge_tiles:
                 continue
             labels[y, x] = CLASS_TO_ID[trap_class]
         return

@@ -76,8 +76,22 @@ class NesyLinkCnnDataset(Dataset):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train TinyHybridCNN on generated NesyLink scene PNG/JSON pairs.")
     parser.add_argument("--data-dir", type=Path, default=CNN_DIR / "generated" / "train")
+    parser.add_argument(
+        "--extra-data-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional PNG/JSON directories to include in the training pool.",
+    )
+    parser.add_argument(
+        "--extra-repeat",
+        type=int,
+        default=1,
+        help="Repeat samples from --extra-data-dir this many times to upweight targeted data.",
+    )
     parser.add_argument("--pattern", default="*.json", help="JSON glob inside --data-dir, e.g. batch30_seed*.json")
     parser.add_argument("--out", type=Path, default=CNN_DIR / "checkpoints" / "tiny_hybrid_cnn_exit_split.pt")
+    parser.add_argument("--init-checkpoint", type=Path, default=None, help="Optional checkpoint/weights to fine-tune from.")
     parser.add_argument("--preview-out", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -101,9 +115,19 @@ def main() -> None:
     seed_everything(args.seed)
     device = choose_device(args.device)
 
-    samples = discover_samples(args.data_dir, args.pattern, limit=args.limit)
+    if args.extra_repeat < 1:
+        raise SystemExit("--extra-repeat must be >= 1")
+    data_dirs = [args.data_dir, *args.extra_data_dir]
+    samples = discover_samples(
+        args.data_dir,
+        args.pattern,
+        extra_data_dirs=args.extra_data_dir,
+        extra_repeat=args.extra_repeat,
+        limit=args.limit,
+    )
     if len(samples) < 2:
-        raise SystemExit(f"Need at least 2 PNG/JSON pairs, found {len(samples)} in {args.data_dir}")
+        joined_dirs = ", ".join(str(path) for path in data_dirs)
+        raise SystemExit(f"Need at least 2 PNG/JSON pairs, found {len(samples)} in {joined_dirs}")
 
     train_samples, val_samples = split_samples(samples, args.val_ratio, args.seed)
     print(f"device={device}")
@@ -126,6 +150,8 @@ def main() -> None:
     )
 
     model = TinyHybridCNN().to(device)
+    if args.init_checkpoint is not None:
+        load_initial_checkpoint(model, args.init_checkpoint, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     tile_weights = build_tile_weights(args.floor_weight, device)
     heatmap_pos_weight = torch.full((len(DYNAMIC_CLASSES), 1, 1), args.heatmap_pos_weight, device=device)
@@ -184,14 +210,44 @@ def choose_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def discover_samples(data_dir: Path, pattern: str, *, limit: int | None) -> list[Sample]:
+def load_initial_checkpoint(model: nn.Module, path: Path, device: torch.device) -> None:
+    if not path.exists():
+        raise SystemExit(f"--init-checkpoint does not exist: {path}")
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+    except Exception:
+        checkpoint = torch.load(path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model.load_state_dict(state_dict)
+    print(f"loaded init checkpoint {path}")
+
+
+def discover_samples(
+    data_dir: Path,
+    pattern: str,
+    *,
+    extra_data_dirs: list[Path],
+    extra_repeat: int,
+    limit: int | None,
+) -> list[Sample]:
+    samples: list[Sample] = []
+    samples.extend(discover_samples_in_dir(data_dir, pattern))
+    extra_samples: list[Sample] = []
+    for extra_dir in extra_data_dirs:
+        extra_samples.extend(discover_samples_in_dir(extra_dir, pattern))
+    for _ in range(extra_repeat):
+        samples.extend(extra_samples)
+    if limit is not None:
+        samples = samples[: max(0, limit)]
+    return samples
+
+
+def discover_samples_in_dir(data_dir: Path, pattern: str) -> list[Sample]:
     samples: list[Sample] = []
     for json_path in sorted(data_dir.glob(pattern)):
         image_path = json_path.with_suffix(".png")
         if image_path.exists():
             samples.append(Sample(image_path=image_path, json_path=json_path))
-    if limit is not None:
-        samples = samples[: max(0, limit)]
     return samples
 
 
