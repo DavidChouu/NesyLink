@@ -1,0 +1,98 @@
+{
+  "episodes": [
+    {
+      "eval_stage": "default",
+      "event_counts": {
+        "action_attack": 2,
+        "action_blocked": 760,
+        "agent_dead": 1,
+        "button_pressed": 1,
+        "chest_opened": 1,
+        "gold_collected": 1,
+        "monster_damaged": 1,
+        "monster_killed": 1,
+        "move_down": 122,
+        "move_left": 15,
+        "move_right": 70,
+        "move_up": 30
+      },
+      "map_variant": "default",
+      "milestones": {
+        "agent_healed": false,
+        "button_pressed": true,
+        "chest_opened": true,
+        "door_opened": false,
+        "environment_completed": false,
+        "exit_reached": false,
+        "gold_collected": true,
+        "item_collected": false,
+        "key_collected": false,
+        "monster_killed": true,
+        "room_changed": false,
+        "trap_triggered": false,
+        "world_completed": false
+      },
+      "obs_variant": "default",
+      "seed": 0,
+      "steps": 1000,
+      "success": false,
+      "task_id": "mathematical_logic/task_5",
+      "terminal_reason": "agent_dead",
+      "terminated": true,
+      "total_reward": -44.00000000000005,
+      "truncated": false
+    }
+  ],
+  "summary": {
+    "mathematical_logic/task_5 [default]": {
+      "avg_reward": -44.00000000000005,
+      "avg_steps": 1000.0,
+      "episodes": 1,
+      "eval_stage": "default",
+      "event_totals": {
+        "action_attack": 2,
+        "action_blocked": 760,
+        "agent_dead": 1,
+        "button_pressed": 1,
+        "chest_opened": 1,
+        "gold_collected": 1,
+        "monster_damaged": 1,
+        "monster_killed": 1,
+        "move_down": 122,
+        "move_left": 15,
+        "move_right": 70,
+        "move_up": 30
+      },
+      "map_variant_counts": {
+        "default": 1
+      },
+      "milestone_rates": {
+        "agent_healed": 0.0,
+        "button_pressed": 1.0,
+        "chest_opened": 1.0,
+        "door_opened": 0.0,
+        "environment_completed": 0.0,
+        "exit_reached": 0.0,
+        "gold_collected": 1.0,
+        "item_collected": 0.0,
+        "key_collected": 0.0,
+        "monster_killed": 1.0,
+        "room_changed": 0.0,
+        "trap_triggered": 0.0,
+        "world_completed": 0.0
+      },
+      "obs_variant_counts": {
+        "default": 1
+      },
+      "progress_rates": {
+        "agent_dead": 1.0,
+        "button_pressed": 1.0,
+        "chest_opened": 1.0,
+        "gold_collected": 1.0,
+        "monster_killed": 1.0
+      },
+      "success_rate": 0.0,
+      "task_id": "mathematical_logic/task_5"
+    }
+  }
+}
