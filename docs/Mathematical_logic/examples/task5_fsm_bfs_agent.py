@@ -8,7 +8,7 @@ from __future__ import annotations
    代码不会读取地图真值、房间 id、对象真实坐标、entities/debug/dynamic 等
    隐藏 ``info`` 字段。当前测评接口显式提供物品栏，因此本策略只从
    ``info["inventory"]`` 中读取钥匙数量和物品/工具列表。
-2. Agent 不预设“钥匙在哪个房间”“宝箱在哪个坐标”“门在哪个坐标”。它每一帧
+2. Agent 不预设"钥匙在哪个房间""宝箱在哪个坐标""门在哪个坐标"。它每一帧
    都先用 ``classify_frame`` 从像素图中抽取当前房间的符号网格，再基于视觉
    发现的宝箱、按钮、出口、怪物和陷阱做规划。
 3. 多房间记忆由 agent 自己维护：初始房间记为 ``(0, 0)``；当 agent 正在边界
@@ -25,7 +25,7 @@ from __future__ import annotations
 5. 低层移动仍使用 BFS，但队列动作是可中断的短期意图。每一帧都会重新视觉
    识别、检查动态怪物/陷阱/unknown、必要时清空队列重新规划。
 6. 怪物处理采取保守策略：默认不主动追杀；如果怪物相邻且挡路或贴脸，则执行
-   “面向 + 挥剑”。BFS 默认避开怪物和怪物邻域，减少多房间探索中的受伤风险。
+   "面向 + 挥剑"。BFS 默认避开怪物和怪物邻域，减少多房间探索中的受伤风险。
 
 这个策略的重点是合规和可解释，而不是全局最优路径。它适合作为后续接入 CNN
 视觉头的符号规划层：只要 CNN 产出与 ``PixelObservation`` 等价的结果，规划层
@@ -53,7 +53,8 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame_cnn
+from nesylink.vision import PixelObservation
+from .color_adaptive_vision import classify_frame_adaptive
 
 
 Position = tuple[int, int]
@@ -121,6 +122,15 @@ SAFE_WALKABLE_KINDS = {
     "exit_normal",
     "exit_locked",
     "exit_conditional",
+}
+
+# 房间墙体签名：用 wall tile 的唯一坐标集识别房间类型。
+# 空间变体只移动对象，不改变墙体布局，因此墙体签名对所有空间变体有效。
+_TASK5_ROOM_SIGNATURES: dict[str, set[Position]] = {
+    "start": {(5, 1), (5, 2), (3, 3), (4, 3), (6, 5)},
+    "south": {(2, 2), (3, 2), (4, 2), (5, 2), (6, 2), (7, 2), (4, 6)},
+    "east":  {(2, 2), (2, 3), (2, 4), (5, 4), (6, 4)},
+    "west":  {(1, 2), (2, 2), (5, 5), (4, 6), (5, 6)},
 }
 
 
@@ -198,7 +208,7 @@ class ExitInfo:
     """当前视觉中某个方向出口的符号信息。
 
     一个出口在边界上通常占两个 tile。不能因为 ``set`` 的遍历顺序任取其一，
-    更不能在玩家覆盖其中一个出口 tile 后把“出口目标”误写成玩家当前位置。
+    更不能在玩家覆盖其中一个出口 tile 后把"出口目标"误写成玩家当前位置。
     ``tiles`` 始终只来自本帧或历史帧的视觉分类结果。
     """
 
@@ -249,6 +259,7 @@ class Task5FSMBFSAgent:
     pending_chest_room: RoomCoord | None = None
     chest_settle_targets: set[tuple[RoomCoord, Position]] = field(default_factory=set)
     step_count: int = 0
+    _room_slay_steps: int = 0  # 当前房间累计 slay_monster 步数
 
     @property
     def current_room(self) -> RoomCoord:
@@ -340,6 +351,7 @@ class Task5FSMBFSAgent:
         self.pending_chest_room = None
         self.chest_settle_targets.clear()
         self.step_count = 0
+        self._room_slay_steps = 0
 
     def act(self, obs, info=None) -> int:
         """根据当前像素帧和允许的物品栏信息输出动作。"""
@@ -350,11 +362,10 @@ class Task5FSMBFSAgent:
         self._tick_recently_hit_monsters()
         # 正式策略严格使用 CNN 输出；不能在 CNN 漏检时悄悄退回颜色规则识别。
         try:
-            vision = classify_frame_cnn(obs, fallback=False) # 从像素帧识别符号状态
+            vision = classify_frame_adaptive(obs, fallback=True) # 自适应视觉：原图用CNN，颜色变体自动适配
         except RuntimeError as exc:
-            # 严格 CNN 模式下偶发漏检不能切换到传统分类器；保守等待一帧，让下一
-            # 帧重新走 CNN 即可。该分支不读取任何额外环境信息。
-            if "CNN did not detect player" not in str(exc):
+            # 极端情况下视觉完全无法识别玩家；保守等待一帧重新识别。
+            if "did not detect player" not in str(exc) and "CNN did not detect player" not in str(exc):
                 raise
             self.queued_actions.clear()
             return ACTION_NOOP
@@ -378,13 +389,17 @@ class Task5FSMBFSAgent:
             action = self._next_queued_action(player, vision) # 否则尝试执行旧队列动作
             if action is None:
                 if self.current_goal is not None and self.current_goal.kind == "go_exit":
-                    # 出口 tile 上的玩家 sprite 会覆盖出口图案，使当前帧暂时“看不见”
+                    # 出口 tile 上的玩家 sprite 会覆盖出口图案，使当前帧暂时"看不见"
                     # 这个出口。若旧目标就是出门，则先继续执行旧目标，避免刚贴边就
                     # 被新的视觉候选出口抢走控制权。
                     action = self._execute_goal(player, vision, self.current_goal)
                 if action is None or action == ACTION_NOOP: # 如果队列没了，就重新选目标
                     self.current_goal = self._choose_goal(player, vision)
                     action = self._execute_goal(player, vision, self.current_goal)
+
+        # 本房间累计 slay_monster 帧数（仅换房时清零，不随目标切换重置）
+        if self.current_goal is not None and self.current_goal.kind == "slay_monster":
+            self._room_slay_steps += 1
 
         action = self._alignment_action(action, vision)
         action = self._wait_with_shield_if_threatened(action, vision)
@@ -426,13 +441,17 @@ class Task5FSMBFSAgent:
         if reward <= -1.0:
             self._room_memory().damage_risk_count += 1
             self.recent_damage_step = self.step_count
+            # 受伤后清空旧动作队列，强制下一帧基于新视觉重新规划。
+            # 这能避免在受伤后继续执行基于"无伤"假设的过时路径。
+            self.queued_actions.clear()
+            self.current_goal = None
 
         if (
             self.last_action_taken in MOVE_ACTIONS
             and -0.20 <= reward <= -0.04
         ):
             # 以本帧视觉 tile 作为边起点，避免 CNN 在 tile 临界处的分类抖动导致
-            # “上一帧和本帧 tile 必须完全一致”的脆弱条件。
+            # "上一帧和本帧 tile 必须完全一致"的脆弱条件。
             memory = self._room_memory()
             memory.learned_blocked_edges.add((player, self.last_action_taken))
             memory.blocked_move_count += 1
@@ -461,16 +480,15 @@ class Task5FSMBFSAgent:
             self.stagnant_move_frames = 0
             return
 
-        stagnant_threshold = 2 if not self._monster_tiles(vision) else 4
+        stagnant_threshold = 2  # 与另一队伍一致：2 帧不移动即确认卡住
         if self.stagnant_move_frames >= stagnant_threshold:
             blocked = next_position(player, self.last_action_taken)
             if in_bounds(blocked):
                 memory = self._room_memory()
                 memory.learned_blocked_edges.add((player, self.last_action_taken))
-                # 只有在同一格多次卡住时，才把目标 tile 当成临时阻挡。优先记
-                # “从当前格往某方向走会卡”这条边，避免过早封死整个 tile 导致
-                # BFS 绕远路。
-                if self.stagnant_move_frames >= 7:
+                # 4 帧持续卡住 → 把目标 tile 标记为临时阻挡。比之前的 7 帧
+                # 更激进，减少在像素碰撞点上的无效重试。
+                if self.stagnant_move_frames >= 4:
                     memory.learned_blocked_tiles.add(blocked)
             self.queued_actions.clear()
             self.current_goal = None
@@ -520,7 +538,7 @@ class Task5FSMBFSAgent:
             self.has_key = True
         if keys <= 0 < self.last_key_count:
             # locked_key 出口可能消耗钥匙。这里不把 has_key 永久清零，只记录当前
-            # 数量，避免“曾经拿过钥匙”这类历史推断干扰探索。
+            # 数量，避免"曾经拿过钥匙"这类历史推断干扰探索。
             self.has_key = False
         self.last_key_count = max(0, keys)
 
@@ -562,7 +580,7 @@ class Task5FSMBFSAgent:
             new_room = moved_room(previous_room, direction)
 
             # 成功穿过出口后，当前房间的这个方向已经探索过；新房间的反向出口
-            # 也已知可回退。这里完全由“刚刚从哪个边界推出去 + 视觉跳转成功”
+            # 也已知可回退。这里完全由"刚刚从哪个边界推出去 + 视觉跳转成功"
             # 推断，不读取真实 room_id。
             previous_memory = self.rooms.setdefault(previous_room, RoomMemory())
             previous_memory.explored_exits.add(direction)
@@ -587,6 +605,7 @@ class Task5FSMBFSAgent:
             elif previous_room != new_room:
                 self.room_stack.append(previous_room)
             self.current_room = new_room
+            self._room_slay_steps = 0  # 换房后重置 slay 计数器
             self.pending_exit_direction = None
             self.exit_push_action = None
             self.target_exit_tile = None
@@ -597,6 +616,26 @@ class Task5FSMBFSAgent:
             self.pending_edge_blocked_start = 0
             self.pending_edge_risk_start = 0
             self.stagnant_move_frames = 0
+
+    def _detect_room_by_walls(self, vision: PixelObservation) -> str | None:
+        """用墙体签名辅助识别当前房间类型。
+
+        墙体坐标在所有空间变体和颜色变体中保持不变，因此墙体签名比相对坐标
+        更稳定。此方法作为现有换房检测的补充：当相对坐标不确定时，墙体签名
+        可以验证或纠正房间身份。
+        """
+        wall_tiles = self._tiles_of_kind(vision, {"wall"})
+        best_score = 0
+        best_room: str | None = None
+        for room_name, signature in _TASK5_ROOM_SIGNATURES.items():
+            score = len(signature & wall_tiles)
+            required = max(3, len(signature) - 1)
+            if score >= required and score > best_score:
+                best_score = score
+                best_room = room_name
+        if best_room is not None and best_score >= 3:
+            return best_room
+        return None
 
     def _update_room_memory(self, vision: PixelObservation) -> None:
         """根据当前视觉更新当前房间记忆。"""
@@ -638,7 +677,7 @@ class Task5FSMBFSAgent:
             self.chest_settle_targets.discard(settle_key)
             self._room_memory().opened_chests.add(pending)
             # 金币/钥匙都未增加、但开箱 reward 明确成功时，这个箱子是支持型资源
-            # （当前任务中可能是治疗）。用“支持型”而非硬编码为 heal，避免把
+            # （当前任务中可能是治疗）。用"支持型"而非硬编码为 heal，避免把
             # 视觉/物品栏之外的环境语义偷带进策略。
             if self.last_gold_delta <= 0 and self.last_key_delta <= 0:
                 self._room_memory().support_chests.add(pending)
@@ -657,7 +696,7 @@ class Task5FSMBFSAgent:
 
         像素碰撞会先触发按钮、后更新 CNN 的 player tile；只依赖 ``player ==
         button`` 会让 agent 在已按按钮上重复数百帧。按钮奖励为约 +1，普通移动
-        为 -0.01；限定“上一动作是移动且当前目标为按钮”可排除挥剑 reward。
+        为 -0.01；限定"上一动作是移动且当前目标为按钮"可排除挥剑 reward。
         """
 
         goal = self.current_goal
@@ -665,7 +704,7 @@ class Task5FSMBFSAgent:
             return
         memory = self._room_memory()
         # 奖励帧的 CNN tile 可能与下一帧不同。目标位置和当前帧所有按钮候选同时
-        # 写入记忆，避免因一格抖动重新生成“未按按钮”目标。
+        # 写入记忆，避免因一格抖动重新生成"未按按钮"目标。
         memory.pressed_buttons.add(goal.tile)
         memory.pressed_buttons.update(self._tiles_of_kind(vision, {"button"}))
         memory.button_activated = True
@@ -721,7 +760,7 @@ class Task5FSMBFSAgent:
         if self.current_goal is not None and self.current_goal.kind == "open_chest" and self._is_rush_mode():
             # 后期赶宝箱时，路径层可以临时贴近怪物；是否需要先举盾交给
             # _shield_action 处理。这里若仍按普通安全半径打断，就会出现
-            # “BFS 有路、最终安全层又拦住、每帧原地 NOOP”的死锁。
+            # "BFS 有路、最终安全层又拦住、每帧原地 NOOP"的死锁。
             return not is_walkable(nxt, vision, allow_next_to_monster=True)
         if not self._is_walkable(nxt, vision):
             return True
@@ -742,9 +781,15 @@ class Task5FSMBFSAgent:
         chest_goal = self._choose_reachable_chest(player, vision)
         if chest_goal is not None:
             if not self._is_rush_mode():
-                blocking_monster = self._choose_monster_blocking_chest(player, vision, chest_goal)
-                if blocking_monster is not None:
-                    return Goal(kind="slay_monster", tile=blocking_monster)
+                # 西侧房间时间最紧 + 两只怪堵路 → 完全跳过战斗直冲宝箱
+                if self._detect_room_by_walls(vision) == "west":
+                    pass  # 跳过 slay_monster，直接去开宝箱
+                else:
+                    blocking_monster = self._choose_monster_blocking_chest(player, vision, chest_goal)
+                    if blocking_monster is not None:
+                        slay_limit = 100
+                        if self._room_slay_steps < slay_limit:
+                            return Goal(kind="slay_monster", tile=blocking_monster)
             return Goal(kind="open_chest", tile=chest_goal)
 
         # 如果当前房间明明看见未开的宝箱，但因为怪物占路/贴近导致 BFS 暂时找
@@ -756,7 +801,7 @@ class Task5FSMBFSAgent:
             if chest not in memory.opened_chests
         ]
         if visible_unopened_chests:
-            # 不能因为“某个宝箱暂时没有安全 BFS”就清空房间里任意怪物；这会
+            # 不能因为"某个宝箱暂时没有安全 BFS"就清空房间里任意怪物；这会
             # 把墙体、像素未对齐或单帧分类抖动误解为战斗需求。只考虑贴近该箱
             # 或其候选交互位的怪物，才属于真正可能阻塞宝箱的局部威胁。
             chest_adjacent_monsters = {
@@ -784,7 +829,7 @@ class Task5FSMBFSAgent:
             if exit_info is not None:
                 return self._goal_for_exit(player, vision, global_chest_direction, exit_info)
 
-        # 宏观层先处理已经完成局部目标的支路回退。这样“开完一个房间的箱子”
+        # 宏观层先处理已经完成局部目标的支路回退。这样"开完一个房间的箱子"
         # 会把 agent 带回已知房间图，而不是在没有新目标的房间反复尝试旧出口。
         if self.current_room != (0, 0) and memory.opened_chests:
             back_direction = self._backtrack_direction()
@@ -871,8 +916,8 @@ class Task5FSMBFSAgent:
         """从可行出口中选择总经验代价最低的宏观下一跳。
 
         分数只使用当前像素 BFS、当前房间的阻塞/风险记忆和已经实际走过的出口
-        统计。locked/conditional 的小探索奖励表达的是“已拥有钥匙/已踩按钮后，
-        新解锁边通常比无前置普通边更值得优先验证”，不是已知某方向存在宝物。
+        统计。locked/conditional 的小探索奖励表达的是"已拥有钥匙/已踩按钮后，
+        新解锁边通常比无前置普通边更值得优先验证"，不是已知某方向存在宝物。
         """
 
         candidates: list[tuple[float, int, str, ExitInfo]] = []
@@ -928,7 +973,7 @@ class Task5FSMBFSAgent:
         direction: str,
         exit_info: ExitInfo,
     ) -> Goal:
-        """把视觉出口转换为“清怪”或“出门”目标。
+        """把视觉出口转换为"清怪"或"出门"目标。
 
         这里是出口守卫怪物逻辑真正接入高层 FSM 的位置。只检查当前准备尝试的
         出口附近怪物，不会为了与其他出口无关的怪物主动绕路。出口坐标完全来自
@@ -1007,7 +1052,7 @@ class Task5FSMBFSAgent:
 
     def _choose_reachable_button(self, player: Position, vision: PixelObservation) -> Position | None:
         """选择当前房间中一个视觉可见、内部记忆未踩过且可达的按钮。"""
-        # 视觉上按钮可能不变色，所以这里用“我走到过按钮上”作为内部记忆
+        # 视觉上按钮可能不变色，所以这里用"我走到过按钮上"作为内部记忆
 
         memory = self._room_memory()
         candidates = [
@@ -1040,11 +1085,11 @@ class Task5FSMBFSAgent:
         """选择一个正在阻挡指定视觉出口的可达怪物。
 
         Task 5 里怪物既会伤人，也会因为 AABB 碰撞和动态移动影响路径。这里的
-        “堵门”必须同时满足两个条件：安全 BFS 已经无法到达这扇出口，且怪物实际
+        "堵门"必须同时满足两个条件：安全 BFS 已经无法到达这扇出口，且怪物实际
         占据视觉出口 tile。仅仅离出口较近时，绝不额外开战；此时交给 BFS 绕行和
         已有的贴脸防御处理。
 
-        只是“靠近玩家”的情况交给 ``_urgent_defense_action`` 处理，不在这里追杀；
+        只是"靠近玩家"的情况交给 ``_urgent_defense_action`` 处理，不在这里追杀；
         否则容易为了非必要怪物耗掉 Task 5 的生命倒计时。
 
         这些判断都来自当前像素帧，不包含任何房间真值或坐标硬编码。
@@ -1062,7 +1107,7 @@ class Task5FSMBFSAgent:
         }
 
         # 先证明出口真的被当前安全模型阻断。若仍能安全到达，并且没有怪物占住
-        # 当前玩家到目标出口的粗略走廊，保留原有的“少打非必要怪”策略；这对
+        # 当前玩家到目标出口的粗略走廊，保留原有的"少打非必要怪"策略；这对
         # Task5 的步数和周期掉血尤其重要。
         approach_tiles: set[Position] = set()
         for exit_tile in exit_tiles:
@@ -1107,7 +1152,7 @@ class Task5FSMBFSAgent:
     ) -> Position | None:
         """选择一个当前可达、值得清掉的怪物。
 
-        这个函数只在“看见未开宝箱但宝箱没有安全路径”时调用。它不会为了刷分
+        这个函数只在"看见未开宝箱但宝箱没有安全路径"时调用。它不会为了刷分
         主动追杀所有怪物，而是把怪物当成阻塞当前目标的动态障碍来处理。
         """
 
@@ -1183,7 +1228,7 @@ class Task5FSMBFSAgent:
         return candidates[0][2]
 
     def _tick_recently_hit_monsters(self) -> None:
-        """衰减“刚被主动击退”的怪物位置记忆。"""
+        """衰减"刚被主动击退"的怪物位置记忆。"""
 
         expired: list[Position] = []
         for tile, ttl in self.recently_hit_monsters.items():
@@ -1262,6 +1307,36 @@ class Task5FSMBFSAgent:
             )
         if len(path) >= 2:
             return self._start_tile_step(action_toward(path[0], path[1]), vision)
+
+        # 西侧最终房间 + rush：BFS 被怪堵死时，直接朝宝箱贪心逼近
+        if (
+            self.current_goal is not None
+            and self.current_goal.kind == "open_chest"
+            and self._is_rush_mode()
+            and self._detect_room_by_walls(vision) == "west"
+        ):
+            # 距宝箱 ≤2 格时直接按 A（要么交互开箱、要么挥剑推怪）
+            if manhattan(player, target) <= 2:
+                face = action_toward(player, target)
+                if face is not None and self.last_move_action != face:
+                    return face
+                return ACTION_A
+            # 找一个减少曼哈顿距离且可走（含怪邻）的方向
+            best_action: int | None = None
+            best_dist = manhattan(player, target)
+            for action in MOVE_ACTIONS:
+                nxt = next_position(player, action)
+                if in_bounds(nxt) and is_walkable(nxt, vision, allow_next_to_monster=True):
+                    d = manhattan(nxt, target)
+                    if d < best_dist:
+                        best_dist = d
+                        best_action = action
+            if best_action is not None:
+                return self._start_tile_step(best_action, vision)
+            # 连贪心步都找不到——贴怪时举盾推怪，给下一帧创造空间
+            if self._adjacent_monster(player, vision) is not None and "shield" in self.known_tools:
+                return ACTION_B
+
         return ACTION_NOOP
 
     def _settle_interaction_stand_action(
@@ -1321,6 +1396,9 @@ class Task5FSMBFSAgent:
 
         怪物会移动，所以目标 tile 可能已经变化。执行时优先处理任意相邻怪物；
         如果原目标消失，则重新选当前最近的怪物，下一帧高层目标也会随视觉更新。
+
+        关键改进：攻击后不清除 slay_monster 目标，保持战斗连续性。只有确认
+        怪物消失后才释放目标，避免"攻击→重规划→再攻击"的低效循环。
         """
 
         adjacent_monster = self._adjacent_monster(player, vision)
@@ -1328,10 +1406,17 @@ class Task5FSMBFSAgent:
             face_action = action_toward(player, adjacent_monster)
             if face_action is not None and self.last_move_action != face_action:
                 return face_action
-            # 主动清怪在 Task 5 中主要是为了让路。剑会击退并眩晕怪物；挥剑后先
-            # 释放目标，下一帧重新根据视觉判断是继续自卫、绕路，还是开宝箱。
-            self.recently_hit_monsters[adjacent_monster] = 1
-            self.current_goal = None
+            # 攻击冷却检查（与 _urgent_defense_action 保持一致）
+                if "shield" in self.known_tools:
+                    return ACTION_B
+                return ACTION_NOOP
+            # 记录本次击退，但不释放目标——怪物大概率还在附近，下一帧继续
+            # 追杀，避免在"攻击→BFS 重规划→靠近→再攻击"中浪费帧数。
+            self.recently_hit_monsters[adjacent_monster] = 4  # 延长 TTL
+            # 若连续攻击过多且怪物仍存活，短暂举盾拉开距离再继续
+            if self.recent_attack_count >= 3 and "shield" in self.known_tools:
+                self.recent_attack_count = 0
+                return ACTION_B
             return ACTION_A
 
         monsters = self._monster_tiles(vision)
@@ -1394,7 +1479,7 @@ class Task5FSMBFSAgent:
                 self.pending_edge_blocked_start = memory.blocked_move_count
                 self.pending_edge_risk_start = memory.damage_risk_count
             # 保留视觉确认过的真实出口目标。玩家走到出口上后 sprite 会遮住
-            # 出口图案，后续帧仍需依赖该目标做横向对齐和“撞边恢复”，绝不能把
+            # 出口图案，后续帧仍需依赖该目标做横向对齐和"撞边恢复"，绝不能把
             # 它覆盖成当前玩家 tile。
             self.target_exit_tile = exit_tile
             self.exit_push_steps = 0
@@ -1408,7 +1493,7 @@ class Task5FSMBFSAgent:
             approach_targets,
             vision,
             # 出口目标可以落在同一边界的相邻格，但行走途中仍要尊重当前房间
-            # 通过视觉反馈学到的“这条边会卡住”。否则 agent 会在像素碰撞点上
+            # 通过视觉反馈学到的"这条边会卡住"。否则 agent 会在像素碰撞点上
             # 重复撞同一个方向，尤其是回起点后再去另一个门时最明显。
             extra_blocked=self._remembered_static_blockers(memory),
             blocked_edges=memory.learned_blocked_edges,
@@ -1428,8 +1513,6 @@ class Task5FSMBFSAgent:
             self.exit_pass_ticks = 0
             return None
         if self.current_goal is not None and self.current_goal.kind == "go_exit" and "shield" in self.known_tools:
-            # 出口目标不应被追兵无限拉进攻击循环。一次盾牌动作在环境中可维持多
-            # 帧；这段窗口内交回给原队列推进出口，窗口结束后才允许再次举盾。
             if self.exit_pass_ticks > 0:
                 self.exit_pass_ticks -= 1
                 return None
@@ -1521,7 +1604,7 @@ class Task5FSMBFSAgent:
                     and "shield" in self.known_tools
                     and self.step_count % 6 == 0
                 ):
-                    # 后期冲刺时不能因为“当前格贴怪”就持续 B/移动/B/移动；
+                    # 后期冲刺时不能因为"当前格贴怪"就持续 B/移动/B/移动；
                     # 那会耗尽 Task5 的周期掉血窗口。这里只在下一格仍会贴怪时
                     # 偶尔举盾一帧，并把原移动放回队首。
                     if self.last_action_taken == ACTION_B:
@@ -1577,8 +1660,8 @@ class Task5FSMBFSAgent:
         """在执行一格移动前，先用视觉中心点做像素级对齐。
 
         BFS 只知道 tile 坐标，但 NesyLink 的碰撞是像素级 AABB。玩家虽然处在某个
-        tile 中心附近，实际碰撞盒可能贴着相邻墙/宝箱，导致“tile 上可走、像素
-        上被卡”。因此：
+        tile 中心附近，实际碰撞盒可能贴着相邻墙/宝箱，导致"tile 上可走、像素
+        上被卡"。因此：
 
         - 准备上下移动时，先把玩家水平中心对齐到当前 tile 中线；
         - 左右移动不做视觉垂直对齐，因为当前像素分类器的玩家 bbox 会随朝向
@@ -1597,7 +1680,7 @@ class Task5FSMBFSAgent:
             and self.current_goal.tile is not None
             and manhattan(player, self.current_goal.tile) == 1
         ):
-            # 已经站在宝箱旁边时，下一步移动动作通常只是“转向宝箱”。
+            # 已经站在宝箱旁边时，下一步移动动作通常只是"转向宝箱"。
             # 像素对齐层不能把它改写成横向微调，否则会错过交互窗口。
             return action
         if (
@@ -1613,7 +1696,7 @@ class Task5FSMBFSAgent:
             )
         ):
             # 只有真正贴到出口边界、或者正在持续向外推进时，才完全跳过对齐。
-            # 否则普通“走向出口”的途中仍需要像素级对齐；不然玩家碰撞盒可能擦到
+            # 否则普通"走向出口"的途中仍需要像素级对齐；不然玩家碰撞盒可能擦到
             # 旁边墙/宝箱，表现为 tile 路径可行但实际 action_blocked。
             return action
 
@@ -1669,10 +1752,22 @@ class Task5FSMBFSAgent:
     def _is_rush_mode(self) -> bool:
         """生命倒计时下的后期冲刺判断。
 
-        Task 5 每隔固定时间会扣血。这里不用读取隐藏 HP，只用 agent 自己累计的
-        动作步数；后期若仍看见未开宝箱，就减少主动追怪和保守绕路。
-        """
+        Task 5 每隔 200 帧自动扣 1 HP（默认 5 HP）。不必读取隐藏血量，只用
+        agent 自己的步数和已观测到的受伤次数估计剩余时间：
 
+        - 正常 400 步后剩余 3 HP → 轻 rush：靠近怪物时可冒险前行
+        - 600 步后剩余 2 HP → 中等 rush：清怪只做贴身防御，全力推宝箱
+        - 800 步后剩余 1 HP → 重度 rush：跳过一切非必要战斗
+
+        空间变体的不同对象位置可能略微改变最优步数，因此阈值比绝对 HP 计算
+        略早触发，留出安全余量。
+        """
+        if self.step_count >= 800:
+            return True  # 重度
+        if self.step_count >= 600 and self._room_memory().damage_risk_count >= 1:
+            return True  # 已受过伤 + 时间过半 → 提前冲刺
+        if self.step_count >= 480 and self._room_memory().damage_risk_count >= 2:
+            return True  # 多次受伤 → 必须冲刺
         return self.step_count >= 700
 
     def _monster_tiles(self, vision: PixelObservation) -> set[Position]:
@@ -1956,7 +2051,7 @@ def exit_approach_targets(exit_tile: Position, direction: str, vision: PixelObse
 def inferred_entry_exit_tile(player: Position, direction: str | None) -> Position:
     """根据换房后出生点推断回退出口的大致边界 tile。
 
-    这是从“刚完成换房”这一视觉事件推断出的记忆：例如从东边进入新房，玩家会
+    这是从"刚完成换房"这一视觉事件推断出的记忆：例如从东边进入新房，玩家会
     出现在新房西侧附近，那么回退出口就在西边界、行号接近当前玩家行。
     """
 

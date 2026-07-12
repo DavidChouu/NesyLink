@@ -42,8 +42,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -130,7 +128,7 @@ class Task3Agent:
     sub_phase: str = "navigate"  # "navigate" | "to_monster" | "attack_monster"
 
     # ---- 像素感知移动状态（替代 task1 的 queued_actions） ----
-    move_target_px: tuple[float, float] | None = None
+    move_target_tile: Position | None = None
     move_action: int | None = None
     move_attempts: int = 0
 
@@ -166,7 +164,7 @@ class Task3Agent:
         del seed, task_id
         self.world_stage = 0
         self.sub_phase = "navigate"
-        self.move_target_px = None
+        self.move_target_tile = None
         self.move_action = None
         self.move_attempts = 0
         self.pending_interact = False
@@ -207,7 +205,7 @@ class Task3Agent:
             self.stuck_counter = 0
 
         if self.stuck_counter > MAX_TILE_MOVE_ATTEMPTS * 2:
-            self.move_target_px = None
+            self.move_target_tile = None
             self.move_action = None
             self.move_attempts = 0
             self.pending_interact = False
@@ -226,8 +224,8 @@ class Task3Agent:
             return ACTION_A
 
         # ---- 像素感知移动：持续朝目标 tile 移动 ----
-        if self.move_target_px is not None and self.move_action is not None:
-            return self._continue_tile_move(info)
+        if self.move_target_tile is not None and self.move_action is not None:
+            return self._continue_tile_move(vision)
 
         # ---- 按当前 world_stage 决策 ----
         action = self._act_by_stage(player, vision)
@@ -237,67 +235,31 @@ class Task3Agent:
     # 像素感知移动
     # ================================================================
 
-    def _continue_tile_move(self, info) -> int:
-        """继续上一次规划的 tile 间移动。"""
+    def _continue_tile_move(self, vision: PixelObservation) -> int:
+        """继续上一次规划的 tile 间移动（纯视觉判断）。"""
         self.move_attempts += 1
-        current_px = self._read_position_px(info)
 
-        if self._has_reached_pixel_target(current_px):
-            self.move_target_px = None
+        # 用视觉检测玩家 tile 是否已到达目标 —— 不读取隐藏的像素坐标。
+        if vision.player is not None and vision.player.tile == self.move_target_tile:
+            self.move_target_tile = None
             self.move_action = None
             self.move_attempts = 0
             return ACTION_NOOP
 
         if self.move_attempts >= MAX_TILE_MOVE_ATTEMPTS:
-            self.move_target_px = None
+            self.move_target_tile = None
             self.move_action = None
             self.move_attempts = 0
             return ACTION_NOOP
 
         return self.move_action
 
-    def _has_reached_pixel_target(self, current_px) -> bool:
-        """检查玩家像素位置是否已越过目标 tile 的边界坐标。"""
-        if current_px is None or self.move_target_px is None:
-            return True
-        tx, ty = self.move_target_px
-        cx, cy = current_px
-        if self.move_action == ACTION_UP:
-            return cy <= ty
-        elif self.move_action == ACTION_DOWN:
-            return cy >= ty
-        elif self.move_action == ACTION_LEFT:
-            return cx <= tx
-        elif self.move_action == ACTION_RIGHT:
-            return cx >= tx
-        return True
-
     def _begin_tile_move(self, action: int, target_tile: Position) -> int:
-        """开始朝目标 tile 移动，记录目标像素坐标。"""
-        self.move_target_px = (
-            float(target_tile[0] * TILE_SIZE),
-            float(target_tile[1] * TILE_SIZE),
-        )
+        """开始朝目标 tile 移动，用视觉 tile 判断到达。"""
+        self.move_target_tile = target_tile
         self.move_action = action
         self.move_attempts = 0
         return action
-
-    @staticmethod
-    def _read_position_px(info) -> tuple[float, float] | None:
-        """从 info 中读取玩家的像素级位置。"""
-        if not isinstance(info, dict):
-            return None
-        agent = info.get("agent")
-        if not isinstance(agent, dict):
-            return None
-        px = agent.get("position_px")
-        if px is None:
-            return None
-        try:
-            arr = np.asarray(px, dtype=np.float32)
-            return (float(arr[0]), float(arr[1]))
-        except (TypeError, ValueError, IndexError):
-            return None
 
     # ================================================================
     # 阶段管理
@@ -315,7 +277,7 @@ class Task3Agent:
             self.world_stage = 5
 
         # 重置新房间的局部状态
-        self.move_target_px = None
+        self.move_target_tile = None
         self.move_action = None
         self.move_attempts = 0
         self.pending_interact = False
@@ -329,7 +291,7 @@ class Task3Agent:
         if (
             self.world_stage == 2
             and self.key_confirmed
-            and self.move_target_px is None
+            and self.move_target_tile is None
             and not self.pending_interact
         ):
             self.world_stage = 3
