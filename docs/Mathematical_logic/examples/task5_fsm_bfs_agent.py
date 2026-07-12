@@ -138,6 +138,7 @@ class RoomMemory:
     opened_chests: set[Position] = field(default_factory=set)
     support_chests: set[Position] = field(default_factory=set)
     pressed_buttons: set[Position] = field(default_factory=set)
+    button_activated: bool = False
     known_exits: dict[str, Position] = field(default_factory=dict)
     explored_exits: set[str] = field(default_factory=set)
     # 无法从 safe_info 直接得知门为何拒绝通过。出口失败只能短暂暂缓，不能
@@ -166,6 +167,21 @@ class ExitStats:
         if self.traversals <= 0:
             return 0.0
         return self.total_steps / self.traversals
+
+
+@dataclass
+class WorldModel:
+    """策略从像素、safe_info 与自身历史归纳出的统一世界状态。"""
+
+    current_room: RoomCoord = (0, 0)
+    rooms: dict[RoomCoord, RoomMemory] = field(default_factory=dict)
+    key_count: int = 0
+    gold_count: int = 0
+    has_key: bool = False
+    known_items: set[str] = field(default_factory=set)
+    known_tools: set[str] = field(default_factory=set)
+    last_reward: float = 0.0
+    recent_damage_step: int | None = None
 
 
 @dataclass(frozen=True)
@@ -204,8 +220,7 @@ class ExitInfo:
 class Task5FSMBFSAgent:
     """Task 5 的合规探索策略。"""
 
-    current_room: RoomCoord = (0, 0)
-    rooms: dict[RoomCoord, RoomMemory] = field(default_factory=dict)
+    world: WorldModel = field(default_factory=WorldModel)
     queued_actions: deque[int] = field(default_factory=deque)
     last_player_tile: Position | None = None
     last_player_center: tuple[float, float] | None = None
@@ -213,13 +228,8 @@ class Task5FSMBFSAgent:
     last_action_taken: int | None = None
     stagnant_move_frames: int = 0
 
-    last_key_count: int = 0
-    last_gold_count: int = 0
     last_key_delta: int = 0
     last_gold_delta: int = 0
-    has_key: bool = False
-    known_items: set[str] = field(default_factory=set)
-    known_tools: set[str] = field(default_factory=set)
 
     current_goal: Goal | None = None
     target_exit_tile: Position | None = None
@@ -234,32 +244,85 @@ class Task5FSMBFSAgent:
     recent_attack_count: int = 0
     recently_hit_monsters: dict[Position, int] = field(default_factory=dict)
     rush_escape_frames: int = 0
+    exit_pass_ticks: int = 0
     pending_chest_interaction: Position | None = None
     pending_chest_room: RoomCoord | None = None
     chest_settle_targets: set[tuple[RoomCoord, Position]] = field(default_factory=set)
-    last_reward: float = 0.0
-    recent_damage_step: int | None = None
     step_count: int = 0
+
+    @property
+    def current_room(self) -> RoomCoord:
+        return self.world.current_room
+
+    @current_room.setter
+    def current_room(self, value: RoomCoord) -> None:
+        self.world.current_room = value
+
+    @property
+    def rooms(self) -> dict[RoomCoord, RoomMemory]:
+        return self.world.rooms
+
+    @property
+    def last_key_count(self) -> int:
+        return self.world.key_count
+
+    @last_key_count.setter
+    def last_key_count(self, value: int) -> None:
+        self.world.key_count = value
+
+    @property
+    def last_gold_count(self) -> int:
+        return self.world.gold_count
+
+    @last_gold_count.setter
+    def last_gold_count(self, value: int) -> None:
+        self.world.gold_count = value
+
+    @property
+    def has_key(self) -> bool:
+        return self.world.has_key
+
+    @has_key.setter
+    def has_key(self, value: bool) -> None:
+        self.world.has_key = value
+
+    @property
+    def known_items(self) -> set[str]:
+        return self.world.known_items
+
+    @property
+    def known_tools(self) -> set[str]:
+        return self.world.known_tools
+
+    @property
+    def last_reward(self) -> float:
+        return self.world.last_reward
+
+    @last_reward.setter
+    def last_reward(self, value: float) -> None:
+        self.world.last_reward = value
+
+    @property
+    def recent_damage_step(self) -> int | None:
+        return self.world.recent_damage_step
+
+    @recent_damage_step.setter
+    def recent_damage_step(self, value: int | None) -> None:
+        self.world.recent_damage_step = value
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
         """在新 episode 开始前清空所有内部记忆。"""
 
         del seed, task_id
-        self.current_room = (0, 0)
-        self.rooms.clear()
+        self.world = WorldModel()
         self.queued_actions.clear()
         self.last_player_tile = None
         self.last_player_center = None
         self.last_move_action = None
         self.last_action_taken = None
         self.stagnant_move_frames = 0
-        self.last_key_count = 0
-        self.last_gold_count = 0
         self.last_key_delta = 0
         self.last_gold_delta = 0
-        self.has_key = False
-        self.known_items.clear()
-        self.known_tools.clear()
         self.current_goal = None
         self.target_exit_tile = None
         self.exit_push_action = None
@@ -272,11 +335,10 @@ class Task5FSMBFSAgent:
         self.recent_attack_count = 0
         self.recently_hit_monsters.clear()
         self.rush_escape_frames = 0
+        self.exit_pass_ticks = 0
         self.pending_chest_interaction = None
         self.pending_chest_room = None
         self.chest_settle_targets.clear()
-        self.last_reward = 0.0
-        self.recent_damage_step = None
         self.step_count = 0
 
     def act(self, obs, info=None) -> int:
@@ -305,6 +367,7 @@ class Task5FSMBFSAgent:
         self._learn_from_motion_feedback(player, vision) # 用视觉反馈学习是否卡住
         self._detect_room_transition(player, vision) # 判断是否换房
         self._update_room_memory(vision) # 更新当前房间记忆
+        self._confirm_button_activation(vision)
         self._confirm_pending_chest_interaction(info, vision)
 
         urgent = self._urgent_defense_action(player, vision)
@@ -589,6 +652,27 @@ class Task5FSMBFSAgent:
         else:
             self.chest_settle_targets.add(settle_key)
 
+    def _confirm_button_activation(self, vision: PixelObservation) -> None:
+        """用移动后的按钮 reward 确认按钮已触发。
+
+        像素碰撞会先触发按钮、后更新 CNN 的 player tile；只依赖 ``player ==
+        button`` 会让 agent 在已按按钮上重复数百帧。按钮奖励为约 +1，普通移动
+        为 -0.01；限定“上一动作是移动且当前目标为按钮”可排除挥剑 reward。
+        """
+
+        goal = self.current_goal
+        if goal is None or goal.kind != "press_button" or goal.tile is None or not (0.5 <= self.last_reward <= 1.5):
+            return
+        memory = self._room_memory()
+        # 奖励帧的 CNN tile 可能与下一帧不同。目标位置和当前帧所有按钮候选同时
+        # 写入记忆，避免因一格抖动重新生成“未按按钮”目标。
+        memory.pressed_buttons.add(goal.tile)
+        memory.pressed_buttons.update(self._tiles_of_kind(vision, {"button"}))
+        memory.button_activated = True
+        memory.deferred_exits_until.clear()
+        self.queued_actions.clear()
+        self.current_goal = None
+
     def _next_queued_action(self, player: Position, vision: PixelObservation) -> int | None:
         """取出一个仍然安全的队列动作；若旧计划失效则清空队列。"""
 
@@ -672,7 +756,19 @@ class Task5FSMBFSAgent:
             if chest not in memory.opened_chests
         ]
         if visible_unopened_chests:
-            monster_goal = self._choose_nearest_reachable_monster(player, vision)
+            # 不能因为“某个宝箱暂时没有安全 BFS”就清空房间里任意怪物；这会
+            # 把墙体、像素未对齐或单帧分类抖动误解为战斗需求。只考虑贴近该箱
+            # 或其候选交互位的怪物，才属于真正可能阻塞宝箱的局部威胁。
+            chest_adjacent_monsters = {
+                monster
+                for monster in self._monster_tiles(vision)
+                if any(manhattan(monster, chest) <= 2 for chest in visible_unopened_chests)
+            }
+            monster_goal = self._choose_nearest_reachable_monster(
+                player,
+                vision,
+                candidates=chest_adjacent_monsters,
+            )
             if monster_goal is not None and not self._is_rush_mode():
                 return Goal(kind="slay_monster", tile=monster_goal)
 
@@ -681,6 +777,12 @@ class Task5FSMBFSAgent:
             return Goal(kind="press_button", tile=button_goal)
 
         exits = self._exit_info_by_direction(vision)
+
+        global_chest_direction = self._next_direction_to_known_chest()
+        if global_chest_direction is not None:
+            exit_info = exits.get(global_chest_direction)
+            if exit_info is not None:
+                return self._goal_for_exit(player, vision, global_chest_direction, exit_info)
 
         # 宏观层先处理已经完成局部目标的支路回退。这样“开完一个房间的箱子”
         # 会把 agent 带回已知房间图，而不是在没有新目标的房间反复尝试旧出口。
@@ -717,6 +819,47 @@ class Task5FSMBFSAgent:
             if direction in memory.known_exits and not self._exit_is_deferred(memory, direction):
                 return Goal(kind="go_exit", tile=memory.known_exits[direction], direction=direction)
         return Goal(kind="wait")
+
+    def _next_direction_to_known_chest(self) -> str | None:
+        """在已发现房间图中，找通往未开宝箱房间的下一条经验最优边。
+
+        这一步只使用 Agent 亲自见过的宝箱与换房连接。未知房间不在图中，仍由
+        探索出口处理；因此不会把地图文件中的未来物体位置带入策略。
+        """
+
+        targets = {
+            room
+            for room, memory in self.rooms.items()
+            if memory.remembered_chests - memory.opened_chests
+        }
+        targets.discard(self.current_room)
+        if not targets:
+            return None
+
+        # 图很小，使用按累计经验代价扩展的 Dijkstra；边没有历史样本时采用固定
+        # 保守先验，已知高风险/高阻塞边自然会在后续重规划中变得不那么优先。
+        frontier: list[tuple[float, RoomCoord, str | None]] = [(0.0, self.current_room, None)]
+        best_cost: dict[RoomCoord, float] = {self.current_room: 0.0}
+        while frontier:
+            frontier.sort(key=lambda item: item[0], reverse=True)
+            cost, room, first_direction = frontier.pop()
+            if cost != best_cost.get(room):
+                continue
+            if room in targets and first_direction is not None:
+                return first_direction
+            room_memory = self.rooms.get(room)
+            if room_memory is None:
+                continue
+            for direction, neighbor in room_memory.connections.items():
+                edge = room_memory.exit_stats.get(direction)
+                edge_cost = 96.0 if edge is None or edge.traversals == 0 else edge.estimated_cost()
+                risk_cost = room_memory.damage_risk_count * 36 + room_memory.blocked_move_count * 3
+                next_cost = cost + edge_cost + risk_cost
+                if next_cost >= best_cost.get(neighbor, float("inf")):
+                    continue
+                best_cost[neighbor] = next_cost
+                frontier.append((next_cost, neighbor, direction if first_direction is None else first_direction))
+        return None
 
     def _choose_macro_exit_goal(
         self,
@@ -827,6 +970,8 @@ class Task5FSMBFSAgent:
         """选择当前房间中一个视觉可见、尚未打开且可达的宝箱。"""
 
         memory = self._room_memory()
+        if memory.button_activated:
+            return None
         candidates = [
             chest
             for chest in self._chest_tiles(vision)
@@ -953,7 +1098,13 @@ class Task5FSMBFSAgent:
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
 
-    def _choose_nearest_reachable_monster(self, player: Position, vision: PixelObservation) -> Position | None:
+    def _choose_nearest_reachable_monster(
+        self,
+        player: Position,
+        vision: PixelObservation,
+        *,
+        candidates: set[Position] | None = None,
+    ) -> Position | None:
         """选择一个当前可达、值得清掉的怪物。
 
         这个函数只在“看见未开宝箱但宝箱没有安全路径”时调用。它不会为了刷分
@@ -961,6 +1112,8 @@ class Task5FSMBFSAgent:
         """
 
         monsters = self._monster_tiles(vision)
+        if candidates is not None:
+            monsters &= candidates
         if not monsters or "sword" not in self.known_tools:
             return None
         memory = self._room_memory()
@@ -1147,6 +1300,7 @@ class Task5FSMBFSAgent:
 
         if player == button:
             self._room_memory().pressed_buttons.add(button)
+            self._room_memory().button_activated = True
             self._room_memory().deferred_exits_until.clear()
             self.current_goal = None
             return ACTION_NOOP
@@ -1271,7 +1425,16 @@ class Task5FSMBFSAgent:
         if monster is None:
             self.recent_attack_count = 0
             self.rush_escape_frames = 0
+            self.exit_pass_ticks = 0
             return None
+        if self.current_goal is not None and self.current_goal.kind == "go_exit" and "shield" in self.known_tools:
+            # 出口目标不应被追兵无限拉进攻击循环。一次盾牌动作在环境中可维持多
+            # 帧；这段窗口内交回给原队列推进出口，窗口结束后才允许再次举盾。
+            if self.exit_pass_ticks > 0:
+                self.exit_pass_ticks -= 1
+                return None
+            self.exit_pass_ticks = 5
+            return ACTION_B
         rushing_for_chest = self._is_rush_mode() and (
             (self.current_goal is not None and self.current_goal.kind == "open_chest")
             or bool(self._chest_tiles(vision))
