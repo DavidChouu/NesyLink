@@ -27,10 +27,12 @@ from nesylink.cnn.generate_eval_dataset import (
     COLOR_VARIANTS,
     MAP_VARIANTS,
     TASK_IDS,
+    apply_runtime_state_annotations,
     apply_obs_variant,
     iter_room_payloads,
     iter_runtime_payloads,
     make_room_standalone,
+    safe_annotations,
     safe_name,
 )
 from nesylink.cnn.generate_synthetic_scene import write_runtime_pixel_annotations
@@ -92,7 +94,7 @@ def iter_samples(args: argparse.Namespace, rng: random.Random) -> Iterable[dict[
                     ):
                         for obs_variant in args.color_variants:
                             variant_payload = copy.deepcopy(rendered["payload"])
-                            annotations = dict(variant_payload.get("annotations", {}))
+                            annotations = safe_annotations(variant_payload)
                             annotations.update(
                                 {
                                     "task_id": task_id,
@@ -129,6 +131,7 @@ def iter_rendered_dynamic_payloads(
         room_path.write_text(json.dumps(base_payload, indent=2) + "\n", encoding="utf-8")
         manager = RoomManager(room_path)
         room = manager.get_room(manager.start_room)
+        apply_runtime_state_annotations(room, base_payload)
 
         walkable_tiles = sorted(runtime_walkable_tiles(room))
         if not walkable_tiles:
@@ -154,7 +157,7 @@ def iter_rendered_dynamic_payloads(
                     monster.position_px = random_position_in_tile(rng, monster_tile, int(monster.size_px))
 
             rendered_payload = copy.deepcopy(base_payload)
-            annotations = dict(rendered_payload.get("annotations", {}))
+            annotations = safe_annotations(rendered_payload)
             annotations["tile_labels"] = tile_labels_from_runtime_room(room)
             rendered_payload["annotations"] = annotations
             write_runtime_pixel_annotations(rendered_payload, player, room)
@@ -237,7 +240,7 @@ def tile_labels_from_runtime_room(room: Any) -> list[list[str]]:
         labels[npc.pos[1]][npc.pos[0]] = "npc"
 
     for button in room.buttons.values():
-        labels[button.pos[1]][button.pos[0]] = "button"
+        labels[button.pos[1]][button.pos[0]] = "button_pressed" if button.is_pressed else "button"
 
     for switch in room.switches.values():
         labels[switch.pos[1]][switch.pos[0]] = "switch"

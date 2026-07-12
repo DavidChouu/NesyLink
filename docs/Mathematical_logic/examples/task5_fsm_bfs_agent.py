@@ -117,6 +117,7 @@ SAFE_WALKABLE_KINDS = {
     "player",
     "bridge",
     "button",
+    "button_pressed",
     "switch",
     "exit_normal",
     "exit_locked",

@@ -17,7 +17,8 @@ self_use/
 
 /tests/
 
+artifacts/
+
 CLAUDE.md
 .claude/
-
 

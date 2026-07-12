@@ -218,8 +218,20 @@ def load_initial_checkpoint(model: nn.Module, path: Path, device: torch.device) 
     except Exception:
         checkpoint = torch.load(path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict)
-    print(f"loaded init checkpoint {path}")
+    current_state = model.state_dict()
+    compatible_state = {
+        name: value
+        for name, value in state_dict.items()
+        if name in current_state and tuple(value.shape) == tuple(current_state[name].shape)
+    }
+    skipped = sorted(name for name in state_dict if name not in compatible_state)
+    current_state.update(compatible_state)
+    model.load_state_dict(current_state)
+    print(f"loaded init checkpoint {path} compatible_tensors={len(compatible_state)} skipped={len(skipped)}")
+    if skipped:
+        preview = ", ".join(skipped[:8])
+        suffix = "" if len(skipped) <= 8 else ", ..."
+        print(f"skipped incompatible tensors: {preview}{suffix}")
 
 
 def discover_samples(

@@ -17,7 +17,7 @@ from nesylink.vision.pixel_classifier import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_targeted_v3.weights.pt"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_button_pressed_all_v1.weights.pt"
 PLAYER_CENTER_ADJUST_PX = (-1.5, -4.5)
 
 

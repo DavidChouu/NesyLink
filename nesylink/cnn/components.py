@@ -22,6 +22,7 @@ COMPONENT_CLASSES = (
     "trap",
     "abyss",
     "button",
+    "button_pressed",
     "switch",
     "gap",
     "bridge",
@@ -44,6 +45,7 @@ SPLIT_TILE_COMPONENT_KINDS = (
     "trap",
     "abyss",
     "button",
+    "button_pressed",
     "switch",
     "gap",
     "bridge",
@@ -59,6 +61,7 @@ COLORS = {
     "trap": (170, 170, 190),
     "abyss": (30, 30, 42),
     "button": (40, 210, 90),
+    "button_pressed": (18, 108, 64),
     "switch": (255, 225, 40),
     "gap": (20, 25, 70),
     "bridge": (190, 115, 45),
@@ -116,10 +119,11 @@ def labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
             labels[y, x] = CLASS_TO_ID[exit_class]
 
     bridge_tiles = dynamic_bridge_tiles_from_room_json(payload)
+    pressed_buttons = pressed_button_ids_from_annotations(payload)
     for obj in payload.get("objects", []):
         if not isinstance(obj, dict):
             continue
-        write_object_label(labels, obj, bridge_tiles=bridge_tiles)
+        write_object_label(labels, obj, bridge_tiles=bridge_tiles, pressed_buttons=pressed_buttons)
 
     spawns = payload.get("spawns", {})
     default_spawn = str(payload.get("default_spawn", "default"))
@@ -161,14 +165,15 @@ def static_labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
                 labels[y, x] = CLASS_TO_ID["wall"]
 
     bridge_tiles = dynamic_bridge_tiles_from_room_json(payload)
+    pressed_buttons = pressed_button_ids_from_annotations(payload)
     objects = [obj for obj in payload.get("objects", []) if isinstance(obj, dict)]
     for obj in objects:
         if str(obj.get("kind")) == "trap":
-            write_object_label(labels, obj, bridge_tiles=bridge_tiles)
+            write_object_label(labels, obj, bridge_tiles=bridge_tiles, pressed_buttons=pressed_buttons)
     for obj in objects:
         if str(obj.get("kind")) in {"monster", "trap"}:
             continue
-        write_object_label(labels, obj, bridge_tiles=bridge_tiles)
+        write_object_label(labels, obj, bridge_tiles=bridge_tiles, pressed_buttons=pressed_buttons)
 
     return labels
 
@@ -205,6 +210,16 @@ def overlay_visible_chests(labels: np.ndarray, payload: dict[str, Any]) -> None:
         pos = obj.get("pos")
         if valid_tile(pos):
             labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID["chest"]
+
+
+def pressed_button_ids_from_annotations(payload: dict[str, Any]) -> set[str]:
+    annotations = payload.get("annotations", {})
+    if not isinstance(annotations, dict):
+        return set()
+    raw_pressed = annotations.get("pressed_buttons", [])
+    if not isinstance(raw_pressed, list):
+        return set()
+    return {str(button_id) for button_id in raw_pressed}
 
 
 def dynamic_targets_from_room_json(payload: dict[str, Any]) -> list[DynamicTarget]:
@@ -345,6 +360,7 @@ def write_object_label(
     obj: dict[str, Any],
     *,
     bridge_tiles: set[tuple[int, int]] | None = None,
+    pressed_buttons: set[str] | None = None,
 ) -> None:
     kind = str(obj.get("kind", "unknown"))
     if kind not in CLASS_TO_ID:
@@ -361,7 +377,10 @@ def write_object_label(
         return
     pos = obj.get("pos")
     if valid_tile(pos):
-        labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID[kind]
+        label_kind = kind
+        if kind == "button" and str(obj.get("id", "")) in (pressed_buttons or set()):
+            label_kind = "button_pressed"
+        labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID[label_kind]
 
 
 
