@@ -53,7 +53,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame_cnn
+from nesylink.vision import PixelObservation, classify_frame
 
 
 Position = tuple[int, int]
@@ -139,7 +139,9 @@ class RoomMemory:
     pressed_buttons: set[Position] = field(default_factory=set)
     known_exits: dict[str, Position] = field(default_factory=dict)
     explored_exits: set[str] = field(default_factory=set)
-    failed_exits: set[str] = field(default_factory=set)
+    # 无法从 safe_info 直接得知门为何拒绝通过。出口失败只能短暂暂缓，不能
+    # 永久拉黑；拿到钥匙或踩按钮后会重新加入探索前沿。
+    deferred_exits_until: dict[str, int] = field(default_factory=dict)
     learned_blocked_tiles: set[Position] = field(default_factory=set)
     learned_blocked_edges: set[tuple[Position, int]] = field(default_factory=set)
 
@@ -155,10 +157,25 @@ class Goal:
 
 @dataclass(frozen=True)
 class ExitInfo:
-    """当前视觉中某个方向出口的符号信息。"""
+    """当前视觉中某个方向出口的符号信息。
 
-    tile: Position
+    一个出口在边界上通常占两个 tile。不能因为 ``set`` 的遍历顺序任取其一，
+    更不能在玩家覆盖其中一个出口 tile 后把“出口目标”误写成玩家当前位置。
+    ``tiles`` 始终只来自本帧或历史帧的视觉分类结果。
+    """
+
+    tiles: frozenset[Position]
     kind: str
+
+    def representative_tile(self) -> Position:
+        """没有玩家位置可用时，返回一个稳定的视觉代表 tile。"""
+
+        return min(self.tiles)
+
+    def nearest_tile(self, player: Position) -> Position:
+        """选择当前玩家最容易对齐的视觉出口 tile。"""
+
+        return min(self.tiles, key=lambda tile: (manhattan(player, tile), tile))
 
 
 @dataclass
@@ -223,7 +240,7 @@ class Task5FSMBFSAgent:
         self.step_count += 1 # 步数加一
         self._update_inventory(info) # 更新允许的 inventory
         self._tick_recently_hit_monsters()
-        vision = classify_frame_cnn(obs, fallback=False) # 从像素帧识别符号状态
+        vision = classify_frame(obs) # 从像素帧识别符号状态
         player = None if vision.player is None else vision.player.tile
         if player is None:
             self.queued_actions.clear()
@@ -308,6 +325,27 @@ class Task5FSMBFSAgent:
 
         return self.rooms.setdefault(self.current_room, RoomMemory())
 
+    def _exit_is_deferred(self, memory: RoomMemory, direction: str) -> bool:
+        """判断出口是否仍处于短暂冷却期，并清理过期记录。"""
+
+        until = memory.deferred_exits_until.get(direction)
+        if until is None:
+            return False
+        if self.step_count >= until:
+            memory.deferred_exits_until.pop(direction, None)
+            return False
+        return True
+
+    def _defer_current_exit(self) -> None:
+        """视觉确认出口推进停滞后，先探索其他前沿而非重复撞门。"""
+
+        goal = self.current_goal
+        if goal is not None and goal.direction is not None:
+            self._room_memory().deferred_exits_until[goal.direction] = self.step_count + 48
+        self.exit_push_action = None
+        self.pending_exit_direction = None
+        self.target_exit_tile = None
+
     def _update_inventory(self, info) -> None:
         """只从允许的物品栏视图中更新钥匙、物品和工具记忆。"""
 
@@ -318,6 +356,9 @@ class Task5FSMBFSAgent:
             keys = int(inventory.get("keys", 0) or 0)
         except (TypeError, ValueError):
             keys = self.last_key_count
+        if keys > self.last_key_count:
+            for memory in self.rooms.values():
+                memory.deferred_exits_until.clear()
         if keys > self.last_key_count or keys > 0:
             self.has_key = True
         if keys <= 0 < self.last_key_count:
@@ -484,10 +525,6 @@ class Task5FSMBFSAgent:
             return Goal(kind="press_button", tile=button_goal)
 
         exits = self._exit_info_by_direction(vision)
-        exit_blocking_monster = self._choose_reachable_monster(player, vision, exits)
-        if exit_blocking_monster is not None and not self._is_rush_mode():
-            return Goal(kind="slay_monster", tile=exit_blocking_monster)
-
         if self.has_key:
             for direction in EXIT_DIRECTION_ORDER:
                 exit_info = exits.get(direction)
@@ -495,9 +532,9 @@ class Task5FSMBFSAgent:
                     exit_info is not None
                     and exit_info.kind == "exit_locked"
                     and direction not in memory.explored_exits
-                    and direction not in memory.failed_exits
+                    and not self._exit_is_deferred(memory, direction)
                 ):
-                    return Goal(kind="go_exit", tile=exit_info.tile, direction=direction)
+                    return self._goal_for_exit(player, vision, direction, exit_info)
 
         for direction in EXIT_DIRECTION_ORDER:
             exit_info = exits.get(direction)
@@ -505,27 +542,56 @@ class Task5FSMBFSAgent:
                 exit_info is not None
                 and exit_info.kind != "exit_locked"
                 and direction not in memory.explored_exits
-                and direction not in memory.failed_exits
+                and not self._exit_is_deferred(memory, direction)
             ):
-                return Goal(kind="go_exit", tile=exit_info.tile, direction=direction)
+                return self._goal_for_exit(player, vision, direction, exit_info)
 
         # 当前房间没有新出口时，沿探索树回退。若当前帧没识别到回退出口，就使用
         # 本房间历史视觉记住的出口 tile。
         back_direction = self._backtrack_direction()
         if back_direction is not None and back_direction in exits:
-            return Goal(kind="go_exit", tile=exits[back_direction].tile, direction=back_direction)
+            return self._goal_for_exit(player, vision, back_direction, exits[back_direction])
         if back_direction is not None and back_direction in memory.known_exits:
             return Goal(kind="go_exit", tile=memory.known_exits[back_direction], direction=back_direction)
 
-        # 如果没有明确目标，尝试可见出口中任意一个，避免长时间原地等待。
+        # 暂缓中的条件门不应每帧重撞；等冷却到期或出现钥匙/按钮状态变化后再试。
         for direction in EXIT_DIRECTION_ORDER:
             exit_info = exits.get(direction)
-            if exit_info is not None:
-                return Goal(kind="go_exit", tile=exit_info.tile, direction=direction)
+            if exit_info is not None and not self._exit_is_deferred(memory, direction):
+                return self._goal_for_exit(player, vision, direction, exit_info)
         for direction in EXIT_DIRECTION_ORDER:
-            if direction in memory.known_exits:
+            if direction in memory.known_exits and not self._exit_is_deferred(memory, direction):
                 return Goal(kind="go_exit", tile=memory.known_exits[direction], direction=direction)
         return Goal(kind="wait")
+
+    def _goal_for_exit(
+        self,
+        player: Position,
+        vision: PixelObservation,
+        direction: str,
+        exit_info: ExitInfo,
+    ) -> Goal:
+        """把视觉出口转换为“清怪”或“出门”目标。
+
+        这里是出口守卫怪物逻辑真正接入高层 FSM 的位置。只检查当前准备尝试的
+        出口附近怪物，不会为了与其他出口无关的怪物主动绕路。出口坐标完全来自
+        ``exit_info.tiles``，空间变体改变出口位置时会随当前视觉自然更新。
+        """
+
+        blocking_monster = self._choose_monster_blocking_exit(
+            player,
+            vision,
+            set(exit_info.tiles),
+        )
+        if blocking_monster is not None:
+            return Goal(kind="slay_monster", tile=blocking_monster)
+        return Goal(
+            kind="go_exit",
+            # 同一出口横截面上的两个 tile 都可能被引擎接受。这里选择稳定代表值，
+            # 而不是随着玩家逐帧移动在两个 tile 之间切换，避免像素对齐逻辑抖动。
+            tile=exit_info.representative_tile(),
+            direction=direction,
+        )
 
     def _execute_goal(self, player: Position, vision: PixelObservation, goal: Goal | None) -> int:
         """把高层目标转换成一步环境动作。"""
@@ -604,19 +670,18 @@ class Task5FSMBFSAgent:
                     best = (score, button)
         return None if best is None else best[1]
 
-    def _choose_reachable_monster(
+    def _choose_monster_blocking_exit(
         self,
         player: Position,
         vision: PixelObservation,
-        exits: dict[str, ExitInfo],
+        exit_tiles: set[Position],
     ) -> Position | None:
-        """选择一个“现在值得处理”的视觉可见怪物。
+        """选择一个正在阻挡指定视觉出口的可达怪物。
 
-        Task 5 里怪物既会伤人，也会因为 AABB 碰撞和动态移动影响路径。如果完全
-        绕开怪物，agent 可能为了避开怪物邻域走很远，甚至被追上。因此这里在两种
-        情况下主动杀怪：
-
-        - 怪物贴着当前视觉可见的未探索出口，可能堵住换房路线。
+        Task 5 里怪物既会伤人，也会因为 AABB 碰撞和动态移动影响路径。这里的
+        “堵门”必须同时满足两个条件：安全 BFS 已经无法到达这扇出口，且怪物实际
+        占据视觉出口 tile。仅仅离出口较近时，绝不额外开战；此时交给 BFS 绕行和
+        已有的贴脸防御处理。
 
         只是“靠近玩家”的情况交给 ``_urgent_defense_action`` 处理，不在这里追杀；
         否则容易为了非必要怪物耗掉 Task 5 的生命倒计时。
@@ -628,21 +693,26 @@ class Task5FSMBFSAgent:
         if not monsters or "sword" not in self.known_tools:
             return None
         memory = self._room_memory()
-        active_exits = [
-            exit_info.tile
-            for direction, exit_info in exits.items()
-            if direction not in memory.explored_exits and direction not in memory.failed_exits
-        ]
+
+        # 先证明出口真的被当前安全模型阻断。若仍能安全到达，保留原有的“少打
+        # 非必要怪”策略；这对 Task5 的步数和周期掉血尤其重要。
+        approach_tiles: set[Position] = set()
+        for exit_tile in exit_tiles:
+            approach_tiles.update(exit_approach_targets(exit_tile, exit_direction(exit_tile) or "", vision))
+        safe_path = bfs_path(
+            player,
+            approach_tiles,
+            vision,
+            extra_blocked=self._remembered_static_blockers(memory),
+            blocked_edges=memory.learned_blocked_edges,
+        )
+        if safe_path:
+            return None
 
         candidates: list[tuple[int, Position]] = []
         for monster in monsters:
-            guards_exit = any(manhattan(monster, exit_tile) <= 2 for exit_tile in active_exits)
-            blocks_corridor = any(
-                monster_blocks_exit_corridor(player, monster, exit_info.tile, direction)
-                for direction, exit_info in exits.items()
-                if direction not in memory.explored_exits and direction not in memory.failed_exits
-            )
-            if not guards_exit and not blocks_corridor:
+            guards_exit = monster in exit_tiles
+            if not guards_exit:
                 continue
             adjacent = self._adjacent_targets({monster}, vision, allow_next_to_monster=True)
             path = bfs_path(
@@ -812,6 +882,7 @@ class Task5FSMBFSAgent:
 
         if player == button:
             self._room_memory().pressed_buttons.add(button)
+            self._room_memory().deferred_exits_until.clear()
             self.current_goal = None
             return ACTION_NOOP
         memory = self._room_memory()
@@ -874,12 +945,6 @@ class Task5FSMBFSAgent:
 
         if self.exit_push_action is not None:
             if self._can_continue_exit_push(player, direction):
-                align_action = exit_alignment_action(player, exit_tile, direction)
-                if align_action is not None and self._alignment_step_is_safe(player, align_action, vision):
-                    self.exit_push_action = None
-                    self.pending_exit_direction = None
-                    self.exit_push_steps = 0
-                    return align_action
                 return self.exit_push_action
             self.exit_push_action = None
             self.target_exit_tile = None
@@ -904,6 +969,9 @@ class Task5FSMBFSAgent:
                 return align_action
             self.exit_push_action = DIRECTION_TO_ACTION[direction]
             self.pending_exit_direction = direction
+            # 保留视觉确认过的真实出口目标。玩家走到出口上后 sprite 会遮住
+            # 出口图案，后续帧仍需依赖该目标做横向对齐和“撞边恢复”，绝不能把
+            # 它覆盖成当前玩家 tile。
             self.target_exit_tile = exit_tile
             self.exit_push_steps = 0
             self.queued_actions.clear()
@@ -1131,17 +1199,26 @@ class Task5FSMBFSAgent:
     def _exit_tiles_by_direction(self, vision: PixelObservation) -> dict[str, Position]:
         exits: dict[str, Position] = {}
         for direction, exit_info in self._exit_info_by_direction(vision).items():
-            exits[direction] = exit_info.tile
+            exits[direction] = exit_info.representative_tile()
         return exits
 
     def _exit_info_by_direction(self, vision: PixelObservation) -> dict[str, "ExitInfo"]:
-        """按方向整理当前视觉里看到的出口 tile 和出口类型。"""
+        """按方向聚合当前视觉里看到的出口 tile 和出口类型。"""
 
-        exits: dict[str, ExitInfo] = {}
+        grouped: dict[str, list[tuple[Position, str]]] = {}
         for tile in self._tiles_of_kind(vision, {"exit_locked", "exit_normal", "exit_conditional"}):
             direction = exit_direction(tile)
             if direction is not None:
-                exits[direction] = ExitInfo(tile=tile, kind=vision.grid[tile[1]][tile[0]])
+                grouped.setdefault(direction, []).append((tile, vision.grid[tile[1]][tile[0]]))
+
+        exits: dict[str, ExitInfo] = {}
+        for direction, entries in grouped.items():
+            # 同一出口横截面的类型应一致；若分类瞬间不一致，优先出现次数最多的
+            # 类型，并保留该类型的所有 tile，避免单个抖动 tile 主导目标选择。
+            kinds = sorted({kind for _, kind in entries})
+            kind = max(kinds, key=lambda candidate: sum(item_kind == candidate for _, item_kind in entries))
+            tiles = frozenset(tile for tile, item_kind in entries if item_kind == kind)
+            exits[direction] = ExitInfo(tiles=tiles, kind=kind)
         return exits
 
     def _adjacent_monster(self, player: Position, vision: PixelObservation) -> Position | None:
@@ -1421,25 +1498,6 @@ def exit_direction(pos: Position) -> str | None:
     if col == GRID_WIDTH - 1:
         return "east"
     return None
-
-
-def monster_blocks_exit_corridor(
-    player: Position,
-    monster: Position,
-    exit_tile: Position,
-    direction: str,
-) -> bool:
-    """Return whether a monster sits in the rough corridor to a visible exit."""
-
-    if direction == "east":
-        return player[0] <= monster[0] <= exit_tile[0] and abs(monster[1] - exit_tile[1]) <= 1
-    if direction == "west":
-        return exit_tile[0] <= monster[0] <= player[0] and abs(monster[1] - exit_tile[1]) <= 1
-    if direction == "south":
-        return player[1] <= monster[1] <= exit_tile[1] and abs(monster[0] - exit_tile[0]) <= 1
-    if direction == "north":
-        return exit_tile[1] <= monster[1] <= player[1] and abs(monster[0] - exit_tile[0]) <= 1
-    return False
 
 
 def moved_room(room: RoomCoord, direction: str) -> RoomCoord:
