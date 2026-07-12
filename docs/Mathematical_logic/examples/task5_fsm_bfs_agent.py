@@ -136,6 +136,7 @@ class RoomMemory:
     remembered_chests: set[Position] = field(default_factory=set)
     remembered_static_blocked: set[Position] = field(default_factory=set)
     opened_chests: set[Position] = field(default_factory=set)
+    support_chests: set[Position] = field(default_factory=set)
     pressed_buttons: set[Position] = field(default_factory=set)
     known_exits: dict[str, Position] = field(default_factory=dict)
     explored_exits: set[str] = field(default_factory=set)
@@ -144,6 +145,27 @@ class RoomMemory:
     deferred_exits_until: dict[str, int] = field(default_factory=dict)
     learned_blocked_tiles: set[Position] = field(default_factory=set)
     learned_blocked_edges: set[tuple[Position, int]] = field(default_factory=set)
+    blocked_move_count: int = 0
+    damage_risk_count: int = 0
+    exit_stats: dict[str, "ExitStats"] = field(default_factory=dict)
+    connections: dict[str, RoomCoord] = field(default_factory=dict)
+
+
+@dataclass
+class ExitStats:
+    """Agent 从自身历史中学习到的一条房间边的经验代价。"""
+
+    traversals: int = 0
+    total_steps: int = 0
+    blocked_moves: int = 0
+    damage_risks: int = 0
+
+    def estimated_cost(self) -> float:
+        """返回已观测通行成本；无样本时由调用方采用保守默认值。"""
+
+        if self.traversals <= 0:
+            return 0.0
+        return self.total_steps / self.traversals
 
 
 @dataclass(frozen=True)
@@ -192,6 +214,9 @@ class Task5FSMBFSAgent:
     stagnant_move_frames: int = 0
 
     last_key_count: int = 0
+    last_gold_count: int = 0
+    last_key_delta: int = 0
+    last_gold_delta: int = 0
     has_key: bool = False
     known_items: set[str] = field(default_factory=set)
     known_tools: set[str] = field(default_factory=set)
@@ -201,6 +226,9 @@ class Task5FSMBFSAgent:
     exit_push_action: int | None = None
     pending_exit_direction: str | None = None
     exit_push_steps: int = 0
+    pending_edge_start_step: int | None = None
+    pending_edge_blocked_start: int = 0
+    pending_edge_risk_start: int = 0
     room_stack: list[RoomCoord] = field(default_factory=list)
 
     recent_attack_count: int = 0
@@ -209,7 +237,8 @@ class Task5FSMBFSAgent:
     pending_chest_interaction: Position | None = None
     pending_chest_room: RoomCoord | None = None
     chest_settle_targets: set[tuple[RoomCoord, Position]] = field(default_factory=set)
-    spatial_variant_mode: bool = False
+    last_reward: float = 0.0
+    recent_damage_step: int | None = None
     step_count: int = 0
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
@@ -225,6 +254,9 @@ class Task5FSMBFSAgent:
         self.last_action_taken = None
         self.stagnant_move_frames = 0
         self.last_key_count = 0
+        self.last_gold_count = 0
+        self.last_key_delta = 0
+        self.last_gold_delta = 0
         self.has_key = False
         self.known_items.clear()
         self.known_tools.clear()
@@ -233,6 +265,9 @@ class Task5FSMBFSAgent:
         self.exit_push_action = None
         self.pending_exit_direction = None
         self.exit_push_steps = 0
+        self.pending_edge_start_step = None
+        self.pending_edge_blocked_start = 0
+        self.pending_edge_risk_start = 0
         self.room_stack.clear()
         self.recent_attack_count = 0
         self.recently_hit_monsters.clear()
@@ -240,7 +275,8 @@ class Task5FSMBFSAgent:
         self.pending_chest_interaction = None
         self.pending_chest_room = None
         self.chest_settle_targets.clear()
-        self.spatial_variant_mode = False
+        self.last_reward = 0.0
+        self.recent_damage_step = None
         self.step_count = 0
 
     def act(self, obs, info=None) -> int:
@@ -250,18 +286,28 @@ class Task5FSMBFSAgent:
         self.step_count += 1 # 步数加一
         self._update_inventory(info) # 更新允许的 inventory
         self._tick_recently_hit_monsters()
-        vision = classify_frame_cnn(obs, fallback=True) # 从像素帧识别符号状态
+        # 正式策略严格使用 CNN 输出；不能在 CNN 漏检时悄悄退回颜色规则识别。
+        try:
+            vision = classify_frame_cnn(obs, fallback=False) # 从像素帧识别符号状态
+        except RuntimeError as exc:
+            # 严格 CNN 模式下偶发漏检不能切换到传统分类器；保守等待一帧，让下一
+            # 帧重新走 CNN 即可。该分支不读取任何额外环境信息。
+            if "CNN did not detect player" not in str(exc):
+                raise
+            self.queued_actions.clear()
+            return ACTION_NOOP
         player = None if vision.player is None else vision.player.tile
         if player is None:
             self.queued_actions.clear()
             return ACTION_NOOP
 
+        self._update_reward_feedback(info, player)
         self._learn_from_motion_feedback(player, vision) # 用视觉反馈学习是否卡住
         self._detect_room_transition(player, vision) # 判断是否换房
         self._update_room_memory(vision) # 更新当前房间记忆
         self._confirm_pending_chest_interaction(info, vision)
 
-        urgent = self._urgent_defense_action(player, vision) # 如果怪物贴脸，优先防御/攻击
+        urgent = self._urgent_defense_action(player, vision)
         if urgent is not None:
             self.queued_actions.clear()
             action = urgent
@@ -294,6 +340,42 @@ class Task5FSMBFSAgent:
         self.last_player_center = vision.player.center_px
         self.last_action_taken = safe_action
         return safe_action
+
+    def _update_reward_feedback(self, info, player: Position) -> None:
+        """将允许的上一帧 reward 转为局部碰撞与风险记忆。
+
+        不读取 ``events`` 或真实 HP。普通移动 reward 是 -0.010；一次被环境拒绝
+        的移动会额外扣 0.050，因此上一帧移动 reward 落在 [-0.20, -0.04] 时可
+        立即确认像素碰撞边无效。相比等待多帧视觉中心不动，这能少浪费数帧。
+
+        较大的负 reward 既可能是周期扣血，也可能是接触/陷阱伤害；safe_info
+        无法可靠地区分二者，故只将其记录为保守风险信号，不伪造精确血量。
+        """
+
+        reward = 0.0
+        if isinstance(info, dict):
+            try:
+                reward = float(info.get("last_reward", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                reward = 0.0
+        self.last_reward = reward
+
+        if reward <= -1.0:
+            self._room_memory().damage_risk_count += 1
+            self.recent_damage_step = self.step_count
+
+        if (
+            self.last_action_taken in MOVE_ACTIONS
+            and -0.20 <= reward <= -0.04
+        ):
+            # 以本帧视觉 tile 作为边起点，避免 CNN 在 tile 临界处的分类抖动导致
+            # “上一帧和本帧 tile 必须完全一致”的脆弱条件。
+            memory = self._room_memory()
+            memory.learned_blocked_edges.add((player, self.last_action_taken))
+            memory.blocked_move_count += 1
+            self.queued_actions.clear()
+            self.current_goal = None
+            self.stagnant_move_frames = 0
 
     def _learn_from_motion_feedback(self, player: Position, vision: PixelObservation) -> None:
         """根据连续视觉帧判断上一移动是否真的产生位移。
@@ -367,6 +449,7 @@ class Task5FSMBFSAgent:
             keys = int(inventory.get("keys", 0) or 0)
         except (TypeError, ValueError):
             keys = self.last_key_count
+        self.last_key_delta = keys - self.last_key_count
         if keys > self.last_key_count:
             for memory in self.rooms.values():
                 memory.deferred_exits_until.clear()
@@ -377,6 +460,13 @@ class Task5FSMBFSAgent:
             # 数量，避免“曾经拿过钥匙”这类历史推断干扰探索。
             self.has_key = False
         self.last_key_count = max(0, keys)
+
+        try:
+            gold = int(inventory.get("gold", 0) or 0)
+        except (TypeError, ValueError):
+            gold = self.last_gold_count
+        self.last_gold_delta = gold - self.last_gold_count
+        self.last_gold_count = max(0, gold)
 
         items = inventory.get("items")
         tools = inventory.get("tools")
@@ -413,10 +503,18 @@ class Task5FSMBFSAgent:
             # 推断，不读取真实 room_id。
             previous_memory = self.rooms.setdefault(previous_room, RoomMemory())
             previous_memory.explored_exits.add(direction)
+            previous_memory.connections[direction] = new_room
+            edge_stats = previous_memory.exit_stats.setdefault(direction, ExitStats())
+            edge_stats.traversals += 1
+            if self.pending_edge_start_step is not None:
+                edge_stats.total_steps += max(1, self.step_count - self.pending_edge_start_step)
+            edge_stats.blocked_moves += max(0, previous_memory.blocked_move_count - self.pending_edge_blocked_start)
+            edge_stats.damage_risks += max(0, previous_memory.damage_risk_count - self.pending_edge_risk_start)
             new_memory = self.rooms.setdefault(new_room, RoomMemory())
             new_memory.visited = True
             opposite_direction = OPPOSITE_DIRECTION[direction]
             new_memory.explored_exits.add(opposite_direction)
+            new_memory.connections[opposite_direction] = previous_room
             new_memory.known_exits.setdefault(opposite_direction, inferred_entry_exit_tile(player, opposite_direction))
 
             # room_stack 是 DFS 式探索栈：走向新房间时压入父房间；如果新房间正好
@@ -432,6 +530,9 @@ class Task5FSMBFSAgent:
             self.current_goal = None
             self.queued_actions.clear()
             self.exit_push_steps = 0
+            self.pending_edge_start_step = None
+            self.pending_edge_blocked_start = 0
+            self.pending_edge_risk_start = 0
             self.stagnant_move_frames = 0
 
     def _update_room_memory(self, vision: PixelObservation) -> None:
@@ -439,10 +540,6 @@ class Task5FSMBFSAgent:
 
         memory = self._room_memory()
         memory.visited = True
-        if self.current_room == (0, 0) and not self.spatial_variant_mode:
-            chest_tiles = self._chest_tiles(vision)
-            if chest_tiles and chest_tiles != {(4, 2)}:
-                self.spatial_variant_mode = True
         for chest in self._chest_tiles(vision):
             memory.remembered_chests.add(chest)
         memory.remembered_static_blocked.update(self._tiles_of_kind(vision, STATIC_BLOCKING_KINDS))
@@ -477,6 +574,11 @@ class Task5FSMBFSAgent:
         if last_reward > 1.2:
             self.chest_settle_targets.discard(settle_key)
             self._room_memory().opened_chests.add(pending)
+            # 金币/钥匙都未增加、但开箱 reward 明确成功时，这个箱子是支持型资源
+            # （当前任务中可能是治疗）。用“支持型”而非硬编码为 heal，避免把
+            # 视觉/物品栏之外的环境语义偷带进策略。
+            if self.last_gold_delta <= 0 and self.last_key_delta <= 0:
+                self._room_memory().support_chests.add(pending)
             if (
                 self.current_goal is not None
                 and self.current_goal.kind == "open_chest"
@@ -579,17 +681,9 @@ class Task5FSMBFSAgent:
             return Goal(kind="press_button", tile=button_goal)
 
         exits = self._exit_info_by_direction(vision)
-        if self.has_key:
-            for direction in EXIT_DIRECTION_ORDER:
-                exit_info = exits.get(direction)
-                if (
-                    exit_info is not None
-                    and exit_info.kind == "exit_locked"
-                    and direction not in memory.explored_exits
-                    and not self._exit_is_deferred(memory, direction)
-                ):
-                    return self._goal_for_exit(player, vision, direction, exit_info)
 
+        # 宏观层先处理已经完成局部目标的支路回退。这样“开完一个房间的箱子”
+        # 会把 agent 带回已知房间图，而不是在没有新目标的房间反复尝试旧出口。
         if self.current_room != (0, 0) and memory.opened_chests:
             back_direction = self._backtrack_direction()
             if back_direction is not None:
@@ -602,15 +696,9 @@ class Task5FSMBFSAgent:
                 if back_direction in memory.known_exits and not self._exit_is_deferred(memory, back_direction):
                     return Goal(kind="go_exit", tile=memory.known_exits[back_direction], direction=back_direction)
 
-        for direction in EXIT_DIRECTION_ORDER:
-            exit_info = exits.get(direction)
-            if (
-                exit_info is not None
-                and exit_info.kind != "exit_locked"
-                and direction not in memory.explored_exits
-                and not self._exit_is_deferred(memory, direction)
-            ):
-                return self._goal_for_exit(player, vision, direction, exit_info)
+        macro_exit = self._choose_macro_exit_goal(player, vision, exits, memory)
+        if macro_exit is not None:
+            return macro_exit
 
         # 当前房间没有新出口时，沿探索树回退。若当前帧没识别到回退出口，就使用
         # 本房间历史视觉记住的出口 tile。
@@ -629,6 +717,66 @@ class Task5FSMBFSAgent:
             if direction in memory.known_exits and not self._exit_is_deferred(memory, direction):
                 return Goal(kind="go_exit", tile=memory.known_exits[direction], direction=direction)
         return Goal(kind="wait")
+
+    def _choose_macro_exit_goal(
+        self,
+        player: Position,
+        vision: PixelObservation,
+        exits: dict[str, ExitInfo],
+        memory: RoomMemory,
+    ) -> Goal | None:
+        """从可行出口中选择总经验代价最低的宏观下一跳。
+
+        分数只使用当前像素 BFS、当前房间的阻塞/风险记忆和已经实际走过的出口
+        统计。locked/conditional 的小探索奖励表达的是“已拥有钥匙/已踩按钮后，
+        新解锁边通常比无前置普通边更值得优先验证”，不是已知某方向存在宝物。
+        """
+
+        candidates: list[tuple[float, int, str, ExitInfo]] = []
+        locked_frontier_exists = self.has_key and any(
+            exit_info.kind == "exit_locked"
+            and direction not in memory.explored_exits
+            and not self._exit_is_deferred(memory, direction)
+            for direction, exit_info in exits.items()
+        )
+        for direction_index, direction in enumerate(EXIT_DIRECTION_ORDER):
+            exit_info = exits.get(direction)
+            if exit_info is None or direction in memory.explored_exits:
+                continue
+            if self._exit_is_deferred(memory, direction):
+                continue
+            if exit_info.kind == "exit_locked" and not self.has_key:
+                continue
+            if locked_frontier_exists and exit_info.kind != "exit_locked":
+                continue
+
+            approaches: set[Position] = set()
+            for tile in exit_info.tiles:
+                approaches.update(exit_approach_targets(tile, direction, vision))
+            path = bfs_path(
+                player,
+                approaches,
+                vision,
+                extra_blocked=self._remembered_static_blockers(memory),
+                blocked_edges=memory.learned_blocked_edges,
+            )
+            if not path:
+                continue
+
+            edge = memory.exit_stats.get(direction)
+            observed_edge_cost = 0.0 if edge is None else edge.estimated_cost()
+            room_risk = memory.damage_risk_count * 36 + memory.blocked_move_count * 3
+            score = (len(path) - 1) * TILE_SIZE + observed_edge_cost + room_risk
+            if exit_info.kind == "exit_locked":
+                score -= 48
+            elif exit_info.kind == "exit_conditional":
+                score -= 28
+            candidates.append((score, direction_index, direction, exit_info))
+
+        if not candidates:
+            return None
+        _, _, direction, exit_info = min(candidates, key=lambda item: (item[0], item[1]))
+        return self._goal_for_exit(player, vision, direction, exit_info)
 
     def _goal_for_exit(
         self,
@@ -912,9 +1060,10 @@ class Task5FSMBFSAgent:
                 self.current_goal is not None
                 and self.current_goal.kind == "open_chest"
             )
-            rush_chest = chest_goal and self._is_rush_mode() and self.current_room == (-1, 0)
             needs_retry_settle = chest_goal and (self.current_room, target) in self.chest_settle_targets
-            if rush_chest or needs_retry_settle:
+            # 仅在上一轮交互未得到开箱奖励时执行 bbox 微调。这样适用于任意房间、
+            # 任意宝箱，而不是为某个已知房间或空间变体单独写分支。
+            if needs_retry_settle:
                 settle_action = self._settle_interaction_stand_action(player, target, vision)
                 if settle_action is not None:
                     return settle_action
@@ -1085,6 +1234,11 @@ class Task5FSMBFSAgent:
                 return align_action
             self.exit_push_action = DIRECTION_TO_ACTION[direction]
             self.pending_exit_direction = direction
+            if self.pending_edge_start_step is None:
+                memory = self._room_memory()
+                self.pending_edge_start_step = self.step_count
+                self.pending_edge_blocked_start = memory.blocked_move_count
+                self.pending_edge_risk_start = memory.damage_risk_count
             # 保留视觉确认过的真实出口目标。玩家走到出口上后 sprite 会遮住
             # 出口图案，后续帧仍需依赖该目标做横向对齐和“撞边恢复”，绝不能把
             # 它覆盖成当前玩家 tile。
@@ -1111,11 +1265,7 @@ class Task5FSMBFSAgent:
         return ACTION_NOOP
 
     def _urgent_defense_action(self, player: Position, vision: PixelObservation) -> int | None:
-        """处理贴脸怪物。
-
-        Task 5 怪物较多。这里不主动追杀怪物，但如果怪物已经相邻，继续移动很可能
-        受伤，所以执行“面向 + 挥剑”的局部反应。这个判断只依赖视觉中的怪物位置。
-        """
+        """处理贴脸怪物，并在后期宝箱冲刺时限制无效攻击。"""
 
         monster = self._adjacent_monster(player, vision)
         if monster is None:
@@ -1123,10 +1273,7 @@ class Task5FSMBFSAgent:
             self.rush_escape_frames = 0
             return None
         rushing_for_chest = self._is_rush_mode() and (
-            (
-                self.current_goal is not None
-                and self.current_goal.kind == "open_chest"
-            )
+            (self.current_goal is not None and self.current_goal.kind == "open_chest")
             or bool(self._chest_tiles(vision))
         )
         if rushing_for_chest and self.rush_escape_frames > 0:
@@ -1363,8 +1510,7 @@ class Task5FSMBFSAgent:
         动作步数；后期若仍看见未开宝箱，就减少主动追怪和保守绕路。
         """
 
-        threshold = 500 if self.spatial_variant_mode else 900
-        return self.step_count >= threshold
+        return self.step_count >= 700
 
     def _monster_tiles(self, vision: PixelObservation) -> set[Position]:
         return {monster.tile for monster in vision.monsters}
