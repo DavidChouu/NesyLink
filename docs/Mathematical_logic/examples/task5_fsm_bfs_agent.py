@@ -397,9 +397,11 @@ class Task5FSMBFSAgent:
                     self.current_goal = self._choose_goal(player, vision)
                     action = self._execute_goal(player, vision, self.current_goal)
 
-        # 本房间累计 slay_monster 帧数（仅换房时清零，不随目标切换重置）
+        # slay 超时：目标切走时重置，只在同一目标连续 slay 时累加
         if self.current_goal is not None and self.current_goal.kind == "slay_monster":
             self._room_slay_steps += 1
+        else:
+            self._room_slay_steps = 0
 
         action = self._alignment_action(action, vision)
         action = self._wait_with_shield_if_threatened(action, vision)
@@ -781,15 +783,10 @@ class Task5FSMBFSAgent:
         chest_goal = self._choose_reachable_chest(player, vision)
         if chest_goal is not None:
             if not self._is_rush_mode():
-                # 西侧房间时间最紧 + 两只怪堵路 → 完全跳过战斗直冲宝箱
-                if self._detect_room_by_walls(vision) == "west":
-                    pass  # 跳过 slay_monster，直接去开宝箱
-                else:
-                    blocking_monster = self._choose_monster_blocking_chest(player, vision, chest_goal)
-                    if blocking_monster is not None:
-                        slay_limit = 100
-                        if self._room_slay_steps < slay_limit:
-                            return Goal(kind="slay_monster", tile=blocking_monster)
+                blocking_monster = self._choose_monster_blocking_chest(player, vision, chest_goal)
+                if blocking_monster is not None:
+                    if self._room_slay_steps < 100:
+                        return Goal(kind="slay_monster", tile=blocking_monster)
             return Goal(kind="open_chest", tile=chest_goal)
 
         # 如果当前房间明明看见未开的宝箱，但因为怪物占路/贴近导致 BFS 暂时找
@@ -1307,36 +1304,6 @@ class Task5FSMBFSAgent:
             )
         if len(path) >= 2:
             return self._start_tile_step(action_toward(path[0], path[1]), vision)
-
-        # 西侧最终房间 + rush：BFS 被怪堵死时，直接朝宝箱贪心逼近
-        if (
-            self.current_goal is not None
-            and self.current_goal.kind == "open_chest"
-            and self._is_rush_mode()
-            and self._detect_room_by_walls(vision) == "west"
-        ):
-            # 距宝箱 ≤2 格时直接按 A（要么交互开箱、要么挥剑推怪）
-            if manhattan(player, target) <= 2:
-                face = action_toward(player, target)
-                if face is not None and self.last_move_action != face:
-                    return face
-                return ACTION_A
-            # 找一个减少曼哈顿距离且可走（含怪邻）的方向
-            best_action: int | None = None
-            best_dist = manhattan(player, target)
-            for action in MOVE_ACTIONS:
-                nxt = next_position(player, action)
-                if in_bounds(nxt) and is_walkable(nxt, vision, allow_next_to_monster=True):
-                    d = manhattan(nxt, target)
-                    if d < best_dist:
-                        best_dist = d
-                        best_action = action
-            if best_action is not None:
-                return self._start_tile_step(best_action, vision)
-            # 连贪心步都找不到——贴怪时举盾推怪，给下一帧创造空间
-            if self._adjacent_monster(player, vision) is not None and "shield" in self.known_tools:
-                return ACTION_B
-
         return ACTION_NOOP
 
     def _settle_interaction_stand_action(
