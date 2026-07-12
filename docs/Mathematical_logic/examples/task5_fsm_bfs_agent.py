@@ -53,8 +53,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation
-from .color_adaptive_vision import classify_frame_adaptive
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 Position = tuple[int, int]
@@ -118,6 +117,7 @@ SAFE_WALKABLE_KINDS = {
     "player",
     "bridge",
     "button",
+    "button_pressed",
     "switch",
     "exit_normal",
     "exit_locked",
@@ -362,7 +362,8 @@ class Task5FSMBFSAgent:
         self._tick_recently_hit_monsters()
         # 正式策略严格使用 CNN 输出；不能在 CNN 漏检时悄悄退回颜色规则识别。
         try:
-            vision = classify_frame_adaptive(obs, fallback=True) # 自适应视觉：原图用CNN，颜色变体自动适配
+            # 只从当前 RGB 帧感知；CNN 异常时退回基础像素分类器，保证策略接口可运行。
+            vision = classify_frame_cnn(obs, fallback=True)
         except RuntimeError as exc:
             # 极端情况下视觉完全无法识别玩家；保守等待一帧重新识别。
             if "did not detect player" not in str(exc) and "CNN did not detect player" not in str(exc):

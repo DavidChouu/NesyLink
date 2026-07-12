@@ -51,6 +51,7 @@ KIND_PRIORITY = (
     "bridge",
     "trap",
     "chest",
+    "button_pressed",
     "button",
     "switch",
     "exit_locked",
@@ -88,7 +89,8 @@ KIND_COLORS: dict[str, tuple[Color, ...]] = {
         sprites.SPIKE_HIGHLIGHT,
     ),
     "abyss": ((0, 0, 0),),
-    "button": (sprites.BUTTON_UP, sprites.BUTTON_DOWN, (86, 146, 104)),
+    "button": (sprites.BUTTON_UP,),
+    "button_pressed": (sprites.BUTTON_DOWN, (86, 146, 104)),
     "switch": (sprites.SWITCH_BODY, sprites.SWITCH_DOWN),
     "gap": (sprites.GAP_DARK, sprites.GAP_MID),
     "bridge": (sprites.BRIDGE_WOOD, sprites.BRIDGE_EDGE),
@@ -250,6 +252,8 @@ def _choose_tile_kind(scores: dict[str, float]) -> str:
         return "trap"
     if scores["npc"] >= 0.12:
         return "npc"
+    if scores["button_pressed"] >= 0.08:
+        return "button_pressed"
     if scores["button"] >= 0.08:
         return "button"
     if scores["exit_locked"] >= 0.18:

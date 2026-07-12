@@ -126,7 +126,7 @@ def iter_samples(args: argparse.Namespace) -> Iterable[dict[str, Any]]:
                         for obs_variant in args.color_variants:
                             variant_image = apply_obs_variant(rendered["image"], obs_variant)
                             variant_payload = copy.deepcopy(rendered["payload"])
-                            annotations = dict(variant_payload.get("annotations", {}))
+                            annotations = safe_annotations(variant_payload)
                             annotations.update(
                                 {
                                     "task_id": task_id,
@@ -165,16 +165,40 @@ def iter_room_payloads(task_id: str, map_variant: str) -> Iterable[dict[str, Any
 
 def iter_runtime_payloads(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
     for dynamic_payload in iter_dynamic_state_payloads(payload):
-        yield dynamic_payload
-        if has_hidden_chest(dynamic_payload):
-            visible_payload = copy.deepcopy(dynamic_payload)
-            for obj in visible_payload.get("objects", []):
-                if isinstance(obj, dict) and str(obj.get("kind")) == "chest" and bool(obj.get("hidden", False)):
-                    obj["hidden"] = False
-            annotations = dict(visible_payload.get("annotations", {}))
-            annotations["hidden_chests_forced_visible"] = True
-            visible_payload["annotations"] = annotations
-            yield visible_payload
+        for button_payload in iter_button_state_payloads(dynamic_payload):
+            yield button_payload
+            if has_hidden_chest(button_payload):
+                visible_payload = copy.deepcopy(button_payload)
+                for obj in visible_payload.get("objects", []):
+                    if isinstance(obj, dict) and str(obj.get("kind")) == "chest" and bool(obj.get("hidden", False)):
+                        obj["hidden"] = False
+                annotations = safe_annotations(visible_payload)
+                annotations["hidden_chests_forced_visible"] = True
+                visible_payload["annotations"] = annotations
+                yield visible_payload
+
+
+def iter_button_state_payloads(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    button_ids = [
+        str(obj.get("id"))
+        for obj in payload.get("objects", [])
+        if isinstance(obj, dict) and str(obj.get("kind")) == "button" and obj.get("id") is not None
+    ]
+
+    base_payload = copy.deepcopy(payload)
+    base_annotations = safe_annotations(base_payload)
+    base_annotations["pressed_buttons"] = []
+    base_payload["annotations"] = base_annotations
+    yield base_payload
+
+    if not button_ids:
+        return
+
+    pressed_payload = copy.deepcopy(payload)
+    pressed_annotations = safe_annotations(pressed_payload)
+    pressed_annotations["pressed_buttons"] = button_ids
+    pressed_payload["annotations"] = pressed_annotations
+    yield pressed_payload
 
 
 def iter_dynamic_state_payloads(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -198,7 +222,7 @@ def iter_dynamic_state_payloads(payload: dict[str, Any]) -> Iterable[dict[str, A
         for obj, state_id in zip(variant_objects, state_ids, strict=True):
             obj["initial_state"] = state_id
             dynamic_state_meta[str(obj.get("id", "dynamic"))] = state_id
-        annotations = dict(variant.get("annotations", {}))
+        annotations = safe_annotations(variant)
         annotations["dynamic_states"] = dynamic_state_meta
         variant["annotations"] = annotations
         yield variant
@@ -221,6 +245,7 @@ def iter_rendered_payloads(
         room_path.write_text(json.dumps(base_payload, indent=2) + "\n", encoding="utf-8")
         manager = RoomManager(room_path)
         room = manager.get_room(manager.start_room)
+        apply_runtime_state_annotations(room, base_payload)
         monster_positions = {
             monster_id: monster.position_px
             for monster_id, monster in room.monsters.items()
@@ -252,6 +277,19 @@ def iter_rendered_payloads(
                         "sample_index": sample_index,
                     }
                     sample_index += 1
+
+
+def apply_runtime_state_annotations(room: Any, payload: dict[str, Any]) -> None:
+    annotations = payload.get("annotations", {})
+    pressed_buttons = annotations.get("pressed_buttons", []) if isinstance(annotations, dict) else []
+    pressed_button_ids = {str(button_id) for button_id in pressed_buttons if button_id is not None}
+    for button_id, button in room.buttons.items():
+        button.is_pressed = button_id in pressed_button_ids
+
+
+def safe_annotations(payload: dict[str, Any]) -> dict[str, Any]:
+    annotations = payload.get("annotations", {})
+    return dict(annotations) if isinstance(annotations, dict) else {}
 
 
 def make_room_standalone(payload: dict[str, Any], spawn_name: str) -> None:
