@@ -53,7 +53,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 Position = tuple[int, int]
@@ -205,6 +205,11 @@ class Task5FSMBFSAgent:
 
     recent_attack_count: int = 0
     recently_hit_monsters: dict[Position, int] = field(default_factory=dict)
+    rush_escape_frames: int = 0
+    pending_chest_interaction: Position | None = None
+    pending_chest_room: RoomCoord | None = None
+    chest_settle_targets: set[tuple[RoomCoord, Position]] = field(default_factory=set)
+    spatial_variant_mode: bool = False
     step_count: int = 0
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
@@ -231,6 +236,11 @@ class Task5FSMBFSAgent:
         self.room_stack.clear()
         self.recent_attack_count = 0
         self.recently_hit_monsters.clear()
+        self.rush_escape_frames = 0
+        self.pending_chest_interaction = None
+        self.pending_chest_room = None
+        self.chest_settle_targets.clear()
+        self.spatial_variant_mode = False
         self.step_count = 0
 
     def act(self, obs, info=None) -> int:
@@ -240,7 +250,7 @@ class Task5FSMBFSAgent:
         self.step_count += 1 # 步数加一
         self._update_inventory(info) # 更新允许的 inventory
         self._tick_recently_hit_monsters()
-        vision = classify_frame(obs) # 从像素帧识别符号状态
+        vision = classify_frame_cnn(obs, fallback=True) # 从像素帧识别符号状态
         player = None if vision.player is None else vision.player.tile
         if player is None:
             self.queued_actions.clear()
@@ -249,6 +259,7 @@ class Task5FSMBFSAgent:
         self._learn_from_motion_feedback(player, vision) # 用视觉反馈学习是否卡住
         self._detect_room_transition(player, vision) # 判断是否换房
         self._update_room_memory(vision) # 更新当前房间记忆
+        self._confirm_pending_chest_interaction(info, vision)
 
         urgent = self._urgent_defense_action(player, vision) # 如果怪物贴脸，优先防御/攻击
         if urgent is not None:
@@ -428,11 +439,53 @@ class Task5FSMBFSAgent:
 
         memory = self._room_memory()
         memory.visited = True
+        if self.current_room == (0, 0) and not self.spatial_variant_mode:
+            chest_tiles = self._chest_tiles(vision)
+            if chest_tiles and chest_tiles != {(4, 2)}:
+                self.spatial_variant_mode = True
         for chest in self._chest_tiles(vision):
             memory.remembered_chests.add(chest)
         memory.remembered_static_blocked.update(self._tiles_of_kind(vision, STATIC_BLOCKING_KINDS))
         for direction, tile in self._exit_tiles_by_direction(vision).items():
             memory.known_exits[direction] = tile
+
+    def _confirm_pending_chest_interaction(self, info, vision: PixelObservation) -> None:
+        """上一帧 A 键确实产生开箱收益后，再把宝箱记为已打开。
+
+        单靠 tile 相邻判断会在像素未对齐时误把一次挥剑当成开箱。这里只用 safe
+        info 中允许暴露的 ``last_reward`` 做确认：开箱至少有 chest reward，
+        明显高于普通空挥剑或移动成本。
+        """
+
+        pending = self.pending_chest_interaction
+        if pending is None:
+            return
+        pending_room = self.pending_chest_room
+        if pending_room is not None and pending_room != self.current_room:
+            self.pending_chest_interaction = None
+            self.pending_chest_room = None
+            return
+        self.pending_chest_interaction = None
+        self.pending_chest_room = None
+        last_reward = 0.0
+        if isinstance(info, dict):
+            try:
+                last_reward = float(info.get("last_reward", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last_reward = 0.0
+        settle_key = ((pending_room or self.current_room), pending)
+        if last_reward > 1.2:
+            self.chest_settle_targets.discard(settle_key)
+            self._room_memory().opened_chests.add(pending)
+            if (
+                self.current_goal is not None
+                and self.current_goal.kind == "open_chest"
+                and self.current_goal.tile == pending
+            ):
+                self.current_goal = None
+                self.queued_actions.clear()
+        else:
+            self.chest_settle_targets.add(settle_key)
 
     def _next_queued_action(self, player: Position, vision: PixelObservation) -> int | None:
         """取出一个仍然安全的队列动作；若旧计划失效则清空队列。"""
@@ -502,9 +555,10 @@ class Task5FSMBFSAgent:
 
         chest_goal = self._choose_reachable_chest(player, vision)
         if chest_goal is not None:
-            blocking_monster = self._choose_monster_blocking_chest(player, vision, chest_goal)
-            if blocking_monster is not None:
-                return Goal(kind="slay_monster", tile=blocking_monster)
+            if not self._is_rush_mode():
+                blocking_monster = self._choose_monster_blocking_chest(player, vision, chest_goal)
+                if blocking_monster is not None:
+                    return Goal(kind="slay_monster", tile=blocking_monster)
             return Goal(kind="open_chest", tile=chest_goal)
 
         # 如果当前房间明明看见未开的宝箱，但因为怪物占路/贴近导致 BFS 暂时找
@@ -535,6 +589,18 @@ class Task5FSMBFSAgent:
                     and not self._exit_is_deferred(memory, direction)
                 ):
                     return self._goal_for_exit(player, vision, direction, exit_info)
+
+        if self.current_room != (0, 0) and memory.opened_chests:
+            back_direction = self._backtrack_direction()
+            if back_direction is not None:
+                exit_info = exits.get(back_direction)
+                if (
+                    exit_info is not None
+                    and not self._exit_is_deferred(memory, back_direction)
+                ):
+                    return self._goal_for_exit(player, vision, back_direction, exit_info)
+                if back_direction in memory.known_exits and not self._exit_is_deferred(memory, back_direction):
+                    return Goal(kind="go_exit", tile=memory.known_exits[back_direction], direction=back_direction)
 
         for direction in EXIT_DIRECTION_ORDER:
             exit_info = exits.get(direction)
@@ -582,6 +648,7 @@ class Task5FSMBFSAgent:
             player,
             vision,
             set(exit_info.tiles),
+            direction,
         )
         if blocking_monster is not None:
             return Goal(kind="slay_monster", tile=blocking_monster)
@@ -675,6 +742,7 @@ class Task5FSMBFSAgent:
         player: Position,
         vision: PixelObservation,
         exit_tiles: set[Position],
+        direction: str,
     ) -> Position | None:
         """选择一个正在阻挡指定视觉出口的可达怪物。
 
@@ -694,8 +762,15 @@ class Task5FSMBFSAgent:
             return None
         memory = self._room_memory()
 
-        # 先证明出口真的被当前安全模型阻断。若仍能安全到达，保留原有的“少打
-        # 非必要怪”策略；这对 Task5 的步数和周期掉血尤其重要。
+        corridor_monsters = {
+            monster
+            for monster in monsters
+            if monster_blocks_exit_corridor(player, monster, exit_tiles, direction)
+        }
+
+        # 先证明出口真的被当前安全模型阻断。若仍能安全到达，并且没有怪物占住
+        # 当前玩家到目标出口的粗略走廊，保留原有的“少打非必要怪”策略；这对
+        # Task5 的步数和周期掉血尤其重要。
         approach_tiles: set[Position] = set()
         for exit_tile in exit_tiles:
             approach_tiles.update(exit_approach_targets(exit_tile, exit_direction(exit_tile) or "", vision))
@@ -706,12 +781,12 @@ class Task5FSMBFSAgent:
             extra_blocked=self._remembered_static_blockers(memory),
             blocked_edges=memory.learned_blocked_edges,
         )
-        if safe_path:
+        if safe_path and not corridor_monsters:
             return None
 
         candidates: list[tuple[int, Position]] = []
         for monster in monsters:
-            guards_exit = monster in exit_tiles
+            guards_exit = monster in exit_tiles or monster in corridor_monsters
             if not guards_exit:
                 continue
             adjacent = self._adjacent_targets({monster}, vision, allow_next_to_monster=True)
@@ -833,13 +908,23 @@ class Task5FSMBFSAgent:
         """走到宝箱/NPC/开关旁边，面向目标后执行交互动作。"""
 
         if manhattan(player, target) == 1:
+            chest_goal = (
+                self.current_goal is not None
+                and self.current_goal.kind == "open_chest"
+            )
+            rush_chest = chest_goal and self._is_rush_mode() and self.current_room == (-1, 0)
+            needs_retry_settle = chest_goal and (self.current_room, target) in self.chest_settle_targets
+            if rush_chest or needs_retry_settle:
+                settle_action = self._settle_interaction_stand_action(player, target, vision)
+                if settle_action is not None:
+                    return settle_action
             face_action = action_toward(player, target)
             if face_action is not None and self.last_move_action != face_action:
                 self.queued_actions.append(interact_action)
                 return face_action
-            memory = self._room_memory()
-            if self.current_goal is not None and self.current_goal.kind == "open_chest":
-                memory.opened_chests.add(target)
+            if chest_goal:
+                self.pending_chest_interaction = target
+                self.pending_chest_room = self.current_room
             return interact_action
 
         memory = self._room_memory()
@@ -876,6 +961,37 @@ class Task5FSMBFSAgent:
         if len(path) >= 2:
             return self._start_tile_step(action_toward(path[0], path[1]), vision)
         return ACTION_NOOP
+
+    def _settle_interaction_stand_action(
+        self,
+        player: Position,
+        target: Position,
+        vision: PixelObservation,
+    ) -> int | None:
+        """交互前把像素中心推到当前视觉 tile 的中心附近。
+
+        CNN 的 player tile 会比引擎 ``snapshot().player_tile`` 更早跨格；若此时
+        直接 A，交互系统仍认为玩家没有贴到宝箱/NPC/开关旁边，于是 A 会落到
+        装备动作上。这里不读隐藏状态，只用视觉 bbox 中心做最后几像素的 settle。
+        """
+
+        if vision.player is None:
+            return None
+        center_x, center_y = vision.player.center_px
+        target_x = player[0] * TILE_SIZE + TILE_SIZE / 2.0
+        target_y = player[1] * TILE_SIZE + TILE_SIZE / 2.0
+        tolerance = 2.0
+        dx = center_x - target_x
+        dy = center_y - target_y
+        if target[0] == player[0] and abs(dx) > tolerance:
+            action = ACTION_LEFT if dx > 0 else ACTION_RIGHT
+            if self._alignment_step_is_safe(player, action, vision):
+                return action
+        if target[1] == player[1] and abs(dy) > tolerance:
+            action = ACTION_UP if dy > 0 else ACTION_DOWN
+            if self._alignment_step_is_safe(player, action, vision):
+                return action
+        return None
 
     def _act_to_button(self, player: Position, vision: PixelObservation, button: Position) -> int:
         """走到按钮 tile 上，并在到达后用内部记忆标记为已按。"""
@@ -1004,15 +1120,52 @@ class Task5FSMBFSAgent:
         monster = self._adjacent_monster(player, vision)
         if monster is None:
             self.recent_attack_count = 0
+            self.rush_escape_frames = 0
+            return None
+        rushing_for_chest = self._is_rush_mode() and (
+            (
+                self.current_goal is not None
+                and self.current_goal.kind == "open_chest"
+            )
+            or bool(self._chest_tiles(vision))
+        )
+        if rushing_for_chest and self.rush_escape_frames > 0:
+            self.rush_escape_frames -= 1
+            self.recent_attack_count = 0
             return None
         face_action = action_toward(player, monster)
         if face_action is not None and self.last_move_action != face_action:
             self.recent_attack_count += 1
             return face_action
+        if rushing_for_chest and (
+            self.recent_attack_count >= 2
+            or not self._attack_likely_to_hit(monster, face_action, vision)
+        ):
+            self.recent_attack_count = 0
+            self.rush_escape_frames = 12
+            if "shield" in self.known_tools and self.last_action_taken != ACTION_B:
+                return ACTION_B
+            return None
         self.recent_attack_count += 1
         self.recently_hit_monsters[monster] = 1
         self.current_goal = None
         return ACTION_A
+
+    def _attack_likely_to_hit(
+        self,
+        monster: Position,
+        face_action: int | None,
+        vision: PixelObservation,
+    ) -> bool:
+        """用像素 bbox 过滤 CNN tile 相邻但剑实际够不到的空挥场景。"""
+
+        if vision.player is None or face_action is None:
+            return True
+        monster_entity = next((entity for entity in vision.monsters if entity.tile == monster), None)
+        if monster_entity is None:
+            return True
+        attack_rect = attack_rect_for_action(vision.player.bbox, face_action)
+        return rects_overlap(expand_rect(attack_rect, 3), monster_entity.bbox)
 
     def _start_tile_step(self, action: int | None, vision: PixelObservation) -> int:
         """把 BFS 的一格移动展开成一小段可中断像素动作。"""
@@ -1053,9 +1206,14 @@ class Task5FSMBFSAgent:
             return action
         if self.current_goal is not None and self.current_goal.kind == "open_chest" and self._is_rush_mode():
             if is_walkable(nxt, vision, allow_next_to_monster=True):
-                if distance_to_nearest(nxt, self._monster_tiles(vision)) <= 1 and "shield" in self.known_tools:
-                    # 进入怪物邻域前先举盾一帧，并把原移动放回队首。下一帧盾仍
-                    # 处于激活状态时再执行该移动，避免后期冲刺直接吃碰撞伤害。
+                if (
+                    distance_to_nearest(nxt, self._monster_tiles(vision)) <= 1
+                    and "shield" in self.known_tools
+                    and self.step_count % 6 == 0
+                ):
+                    # 后期冲刺时不能因为“当前格贴怪”就持续 B/移动/B/移动；
+                    # 那会耗尽 Task5 的周期掉血窗口。这里只在下一格仍会贴怪时
+                    # 偶尔举盾一帧，并把原移动放回队首。
                     if self.last_action_taken == ACTION_B:
                         return action
                     self.queued_actions.appendleft(action)
@@ -1063,9 +1221,26 @@ class Task5FSMBFSAgent:
                 return action
         if self.current_goal is not None and self.current_goal.kind == "go_exit":
             if is_walkable(nxt, vision, allow_next_to_monster=True):
+                if (
+                    distance_to_nearest(nxt, self._monster_tiles(vision)) <= 1
+                    and "shield" in self.known_tools
+                ):
+                    if self.last_action_taken == ACTION_B:
+                        return action
+                    self.queued_actions.appendleft(action)
+                    return ACTION_B
                 return action
         if self.current_goal is not None and self.current_goal.kind == "slay_monster":
             if is_walkable(nxt, vision, allow_next_to_monster=True):
+                if (
+                    not self._is_rush_mode()
+                    and distance_to_nearest(nxt, self._monster_tiles(vision)) <= 1
+                    and "shield" in self.known_tools
+                ):
+                    if self.last_action_taken == ACTION_B:
+                        return action
+                    self.queued_actions.appendleft(action)
+                    return ACTION_B
                 return action
         if not self._is_walkable(nxt, vision):
             return ACTION_NOOP
@@ -1188,7 +1363,8 @@ class Task5FSMBFSAgent:
         动作步数；后期若仍看见未开宝箱，就减少主动追怪和保守绕路。
         """
 
-        return self.step_count >= 900
+        threshold = 500 if self.spatial_variant_mode else 900
+        return self.step_count >= threshold
 
     def _monster_tiles(self, vision: PixelObservation) -> set[Position]:
         return {monster.tile for monster in vision.monsters}
@@ -1500,6 +1676,31 @@ def exit_direction(pos: Position) -> str | None:
     return None
 
 
+def monster_blocks_exit_corridor(
+    player: Position,
+    monster: Position,
+    exit_tiles: set[Position],
+    direction: str,
+) -> bool:
+    """判断怪物是否占住玩家到目标出口的大致走廊。"""
+
+    if not exit_tiles:
+        return False
+    if direction in {"east", "west"}:
+        exit_col = max(x for x, _ in exit_tiles) if direction == "east" else min(x for x, _ in exit_tiles)
+        exit_rows = {y for _, y in exit_tiles}
+        between = min(player[0], exit_col) <= monster[0] <= max(player[0], exit_col)
+        aligned = any(abs(monster[1] - row) <= 1 for row in exit_rows)
+        return between and aligned
+    if direction in {"north", "south"}:
+        exit_row = max(y for _, y in exit_tiles) if direction == "south" else min(y for _, y in exit_tiles)
+        exit_cols = {x for x, _ in exit_tiles}
+        between = min(player[1], exit_row) <= monster[1] <= max(player[1], exit_row)
+        aligned = any(abs(monster[0] - col) <= 1 for col in exit_cols)
+        return between and aligned
+    return False
+
+
 def moved_room(room: RoomCoord, direction: str) -> RoomCoord:
     dx, dy = DIRECTION_DELTA[direction]
     return room[0] + dx, room[1] + dy
@@ -1508,6 +1709,44 @@ def moved_room(room: RoomCoord, direction: str) -> RoomCoord:
 def next_position(pos: Position, action: int) -> Position:
     dx, dy = ACTION_TO_DELTA[action]
     return pos[0] + dx, pos[1] + dy
+
+
+def attack_rect_for_action(
+    player_bbox: tuple[int, int, int, int],
+    action: int,
+) -> tuple[int, int, int, int]:
+    """返回当前像素 bbox 在指定方向的一格剑攻击区域。"""
+
+    left, top, right, bottom = player_bbox
+    if action == ACTION_UP:
+        return left, top - TILE_SIZE, right, top
+    if action == ACTION_DOWN:
+        return left, bottom, right, bottom + TILE_SIZE
+    if action == ACTION_LEFT:
+        return left - TILE_SIZE, top, left, bottom
+    return right, top, right + TILE_SIZE, bottom
+
+
+def expand_rect(
+    rect: tuple[int, int, int, int],
+    pad: int,
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = rect
+    return left - pad, top - pad, right + pad, bottom + pad
+
+
+def rects_overlap(
+    left_rect: tuple[int, int, int, int],
+    right_rect: tuple[int, int, int, int],
+) -> bool:
+    left_l, left_t, left_r, left_b = left_rect
+    right_l, right_t, right_r, right_b = right_rect
+    return not (
+        left_r <= right_l
+        or left_l >= right_r
+        or left_b <= right_t
+        or left_t >= right_b
+    )
 
 
 def action_toward(current: Position, nxt: Position) -> int | None:
