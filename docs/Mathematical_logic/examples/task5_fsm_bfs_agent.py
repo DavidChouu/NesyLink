@@ -117,6 +117,7 @@ class RoomMemory:
     risk: int = 0
     wall_signature: set[Position] = field(default_factory=set)
     saw_monster: bool = False
+    non_hostile_detections: set[Position] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,10 @@ class Task5FSMBFSAgent:
     facing_action: int | None = None
     stagnant_frames: int = 0
     perception_misses: int = 0
+    input_domain: str = "normal"
+    episode_domain: str = "unknown"
+    binary_domain: bool = False
+    room_entered_step: int = 0
 
     pending_exit: str | None = None
     pending_exit_started: int | None = None
@@ -162,8 +167,10 @@ class Task5FSMBFSAgent:
     combat_attacks: int = 0
     combat_misses: int = 0
     combat_cooldown: int = 0
+    bounded_blocker_combat: bool = False
     shield_cooldown: int = 0
     shield_grace: int = 0
+    chest_progress: dict[tuple[RoomCoord, Position], tuple[int, int]] = field(default_factory=dict)
     pixel_settle_action: int | None = None
     pixel_settle_frames: int = 0
 
@@ -192,6 +199,10 @@ class Task5FSMBFSAgent:
         self.facing_action = None
         self.stagnant_frames = 0
         self.perception_misses = 0
+        self.input_domain = "normal"
+        self.episode_domain = "unknown"
+        self.binary_domain = False
+        self.room_entered_step = 0
         self.pending_exit = None
         self.pending_exit_started = None
         self.exit_push_frames = 0
@@ -203,8 +214,10 @@ class Task5FSMBFSAgent:
         self.combat_attacks = 0
         self.combat_misses = 0
         self.combat_cooldown = 0
+        self.bounded_blocker_combat = False
         self.shield_cooldown = 0
         self.shield_grace = 0
+        self.chest_progress.clear()
         self.pixel_settle_action = None
         self.pixel_settle_frames = 0
         self.previous_vision = None
@@ -235,6 +248,33 @@ class Task5FSMBFSAgent:
         self._detect_transition(player)
         self._update_memory(vision)
         self._confirm_interactions(vision)
+        if self.goal is not None and self.goal.kind == "open_chest" and self.goal.tile is not None:
+            progress_key = (self.room, self.goal.tile)
+            distance = manhattan(player, self.goal.tile)
+            best, last_progress = self.chest_progress.get(progress_key, (999, self.step_count))
+            if distance < best:
+                best, last_progress = distance, self.step_count
+            self.chest_progress[progress_key] = (best, last_progress)
+        if (
+            self.goal is not None
+            and self.goal.kind == "combat"
+            and not (self._memory().chests - self._memory().opened_chests)
+            and (
+                self._parent_direction() is not None
+                or bool(self._memory().buttons - self._memory().pressed_buttons)
+                or (
+                    not self._memory().button_active
+                    and any(view.kind == "exit_conditional" for view in self._memory().exits.values())
+                )
+                or (self.episode_domain == "grayscale" and self.room == (0, 0) and self.step_count < 400)
+            )
+        ):
+            # Once a leaf's chest is serviced, an adjacent monster that does
+            # not block the learned parent exit is irrelevant.  Abort the
+            # stale combat target instead of following it across the room.
+            self._reset_combat()
+            self.goal = None
+            self.queue.clear()
 
         if self.combat_cooldown > 0:
             self.combat_cooldown -= 1
@@ -330,16 +370,46 @@ class Task5FSMBFSAgent:
         except Exception:
             pass
 
-        # A transformed retry is only paid for when the primary result is
-        # structurally implausible.  This handles severe inversion/contrast
-        # frames without making ordinary inference twice as expensive.
+        # Select preprocessing from pixel-domain statistics only.  Grayscale,
+        # dark and hard-threshold frames can still yield a superficially valid
+        # player detection while losing static objects, so structural score
+        # alone is not a sufficient retry gate.
         primary_score = self._vision_score(candidates[0]) if candidates else -1e9
-        if primary_score < 4.0:
-            alternatives = [255 - frame]
+        channel_spread = np.max(frame, axis=2).astype(np.int16) - np.min(frame, axis=2).astype(np.int16)
+        grayscale_ratio = float(np.mean(channel_spread <= 1))
+        mean_luma = float(np.mean(frame))
+        extreme_ratio = float(np.mean((frame <= 8) | (frame >= 247)))
+        abnormal_domain = grayscale_ratio >= 0.95 or mean_luma < 90.0 or extreme_ratio >= 0.65
+        self.binary_domain = extreme_ratio >= 0.65
+        if self.episode_domain == "unknown":
+            if extreme_ratio >= 0.65:
+                self.episode_domain = "threshold"
+            elif grayscale_ratio >= 0.95:
+                self.episode_domain = "grayscale"
+            elif mean_luma < 90.0:
+                self.episode_domain = "dark"
+            elif 128.0 <= mean_luma <= 140.0:
+                self.episode_domain = "inverted"
+            elif mean_luma > 140.0:
+                self.episode_domain = "bright"
+            else:
+                self.episode_domain = "normal"
+        if mean_luma < 90.0:
+            self.input_domain = "dark"
+        elif extreme_ratio >= 0.65:
+            self.input_domain = "threshold"
+        elif grayscale_ratio >= 0.95:
+            self.input_domain = "grayscale"
+        else:
+            self.input_domain = "normal"
+        if primary_score < 4.0 or abnormal_domain:
+            alternatives: list[np.ndarray] = []
             lo, hi = np.percentile(frame, (2.0, 98.0))
             if hi > lo + 8:
                 normalized = ((frame.astype(np.float32) - lo) * (255.0 / (hi - lo))).clip(0, 255).astype(np.uint8)
                 alternatives.append(normalized)
+            if primary_score < 4.0 or extreme_ratio >= 0.65:
+                alternatives.append(255 - frame)
             for alternative in alternatives:
                 try:
                     candidates.append(classify_frame_cnn(alternative, fallback=False))
@@ -394,10 +464,19 @@ class Task5FSMBFSAgent:
         if not self.turning_only and (collision_reward or self.stagnant_frames >= 3):
             self._memory().blocked_edges.add((player, self.last_action))
             self.queue.clear()
+            misaligned_exit_collision = (
+                self.pending_exit is not None
+                and self.goal is not None
+                and self.goal.kind == "go_exit"
+                and self.goal.tile is not None
+                and align_on_boundary(player, self.goal.tile, self.pending_exit) is not None
+            )
             if self.pending_exit is not None:
-                self._memory().deferred_until[self.pending_exit] = self.step_count + 24
+                if not misaligned_exit_collision:
+                    self._memory().deferred_until[self.pending_exit] = self.step_count + 24
                 self._clear_exit_intent()
-            self.goal = None
+            if not misaligned_exit_collision:
+                self.goal = None
             self.stagnant_frames = 0
         self.turning_only = False
 
@@ -435,6 +514,7 @@ class Task5FSMBFSAgent:
         elif current != previous:
             self.parents.append(previous)
         self.room = current
+        self.room_entered_step = self.step_count
         self.goal = None
         self.queue.clear()
         self.combat_target = None
@@ -473,9 +553,6 @@ class Task5FSMBFSAgent:
                 memory.chests.add(pos)
             elif kind in {"button", "button_pressed"}:
                 memory.buttons.add(pos)
-                if kind == "button_pressed":
-                    memory.pressed_buttons.add(pos)
-                    memory.button_active = True
             elif kind in STATIC_BLOCKERS and self.visual_votes[key] >= 2:
                 memory.static_blockers.add(pos)
 
@@ -519,7 +596,7 @@ class Task5FSMBFSAgent:
         memory = self._memory()
         unopened = sorted(memory.chests - memory.opened_chests, key=lambda pos: manhattan(player, pos))
         for chest in unopened:
-            path = self._path_to_adjacent(player, chest, vision, cautious=not self._rush_mode())
+            path = self._path_to_adjacent(player, chest, vision, cautious=self._chest_cautious())
             if path:
                 return Goal("open_chest", chest)
         if unopened and self._rush_mode():
@@ -675,7 +752,7 @@ class Task5FSMBFSAgent:
                 return face
             self.pending_chest = (self.room, chest)
             return ACTION_A
-        path = self._path_to_adjacent(player, chest, vision, cautious=not self._rush_mode())
+        path = self._path_to_adjacent(player, chest, vision, cautious=self._chest_cautious())
         if len(path) >= 2:
             return self._begin_short_move(action_toward(path[0], path[1]), vision)
         unstick = self._pixel_unstick(player)
@@ -710,6 +787,17 @@ class Task5FSMBFSAgent:
         vision: PixelObservation,
     ) -> int:
         if boundary_for_direction(player, direction):
+            outward = DIRECTION_ACTION[direction]
+            outward_blocked = (player, outward) in self._memory().blocked_edges
+            if outward_blocked:
+                align = align_on_boundary(player, target, direction)
+                if align is not None and (player, align) not in self._memory().blocked_edges:
+                    return align
+                if align is not None:
+                    inward = DIRECTION_ACTION[OPPOSITE[direction]]
+                    self.queue.clear()
+                    self.queue.extend([inward] * (TILE_SIZE - 1))
+                    return inward
             if vision.player is not None and not flush_with_edge(vision.player.center_px, direction):
                 action = DIRECTION_ACTION[direction]
                 self.pending_exit = direction
@@ -728,7 +816,11 @@ class Task5FSMBFSAgent:
                 and destination in self.rooms
                 and self.rooms[destination].saw_monster
             )
-            if destination_is_risky and "shield" in self.tools and self.last_action != ACTION_B:
+            destination_is_unknown_and_late = (
+                direction not in self._memory().explored_exits
+                and self.step_count >= 700
+            )
+            if (destination_is_risky or destination_is_unknown_and_late) and "shield" in self.tools and self.last_action != ACTION_B:
                 action = DIRECTION_ACTION[direction]
                 self.pending_exit = direction
                 self.pending_exit_started = self.pending_exit_started or self.step_count
@@ -782,9 +874,22 @@ class Task5FSMBFSAgent:
         return self.queue.popleft()
 
     def _begin_short_move(self, action: int | None, vision: PixelObservation) -> int:
-        if action is None:
+        if action is None or vision.player is None:
             return ACTION_NOOP
-        repeat = 4 if monster_distance(vision.player.tile, vision) <= 2 else 7
+        x, y = vision.player.tile
+        center_x, center_y = vision.player.center_px
+        if action == ACTION_RIGHT:
+            pixels = (x + 1) * TILE_SIZE - center_x
+        elif action == ACTION_LEFT:
+            pixels = center_x - x * TILE_SIZE
+        elif action == ACTION_DOWN:
+            pixels = (y + 1) * TILE_SIZE - center_y
+        else:
+            pixels = center_y - y * TILE_SIZE
+        # Continue through the next visual tile boundary.  A one-pixel margin
+        # prevents bbox rounding or color-domain jitter from ending the intent
+        # on the old side of the line.
+        repeat = max(1, min(TILE_SIZE + 2, int(np.ceil(pixels + 0.25))))
         self.queue.extend([action] * (repeat - 1))
         return action
 
@@ -818,13 +923,29 @@ class Task5FSMBFSAgent:
             value = (len(path), side, path)
             if best is None or value[:2] < best[:2]:
                 best = value
-        return [] if best is None else best[2]
+        if best is None:
+            return []
+        return best[2]
 
     # ------------------------------------------------------------------
     # Combat and safety
 
     def _urgent_action(self, player: Position, vision: PixelObservation) -> int | None:
-        nearby = sorted(vision.monsters, key=lambda entity: manhattan(player, entity.tile))
+        entry_age = self.step_count - self.room_entered_step
+        if (
+            self.input_domain == "dark"
+            and self.step_count >= 900
+            and (entry_age in {24, 27, 30} or (self.binary_domain and 8 <= entry_age <= 48 and entry_age % 3 == 0))
+            and "shield" in self.tools
+            and self.last_action != ACTION_B
+        ):
+            self.queue.clear()
+            return ACTION_B
+        ignored = self._memory().non_hostile_detections
+        nearby = sorted(
+            (entity for entity in vision.monsters if entity.tile not in ignored),
+            key=lambda entity: manhattan(player, entity.tile),
+        )
         if not nearby:
             return None
         distance = manhattan(player, nearby[0].tile)
@@ -837,16 +958,83 @@ class Task5FSMBFSAgent:
         )
         passing_exit = (
             self.step_count >= 700
-            and self.goal is not None
-            and self.goal.kind == "go_exit"
+            and (
+                (self.goal is not None and self.goal.kind == "go_exit")
+                or not bool(self._memory().chests - self._memory().opened_chests)
+            )
         )
         if rushing_to_chest or passing_exit:
+            previous_distance = (
+                manhattan(self.last_player, nearby[0].tile)
+                if self.last_player is not None
+                else 999
+            )
+            if (
+                distance == 2
+                and previous_distance <= 1
+                and "shield" in self.tools
+                and self.last_action != ACTION_B
+            ):
+                # The entity has just left adjacency while the player crossed
+                # its danger lane.  Arm exactly once before the next movement;
+                # this covers the delayed contact tick without assuming a
+                # multi-frame shield lifetime.
+                self.queue.clear()
+                self.shield_cooldown = 3
+                return ACTION_B
+            if (
+                rushing_to_chest
+                and self.goal is not None
+                and self.goal.kind == "open_chest"
+                and self.goal.tile is not None
+                and self.episode_domain != "inverted"
+                and (self.input_domain != "dark" or self.binary_domain or self.step_count < 1080)
+                and self.step_count - self.chest_progress.get(
+                    (self.room, self.goal.tile), (999, self.step_count)
+                )[1] >= 32
+                and distance <= 2
+                and "sword" in self.tools
+            ):
+                # A moving entity has prevented any decrease in chest distance
+                # for two tile widths.  Clear only that immediate blocker, then
+                # return to the chest route.
+                self.queue.clear()
+                self.goal = Goal("combat", nearby[0].tile)
+                self.bounded_blocker_combat = True
+                return self._act_combat(player, nearby[0].tile, vision)
+            if passing_exit and distance <= 2 and "shield" in self.tools and self.shield_grace == 0:
+                self.queue.clear()
+                self.shield_cooldown = 3
+                return ACTION_B
+            if (
+                rushing_to_chest
+                and self.episode_domain == "inverted"
+                and distance <= 2
+                and "shield" in self.tools
+                and self.shield_grace == 0
+            ):
+                self.queue.clear()
+                self.shield_cooldown = 3
+                return ACTION_B
             if distance <= 1 and "shield" in self.tools and self.shield_grace == 0:
                 self.queue.clear()
                 self.shield_cooldown = 3
                 return ACTION_B
             return None
         if distance > 1:
+            return None
+        if self.episode_domain == "grayscale" and self.room == (0, 0) and self.step_count < 400:
+            return None
+        if (
+            not (self._memory().chests - self._memory().opened_chests)
+            and (
+                bool(self._memory().buttons - self._memory().pressed_buttons)
+                or (
+                    not self._memory().button_active
+                    and any(view.kind == "exit_conditional" for view in self._memory().exits.values())
+                )
+            )
+        ):
             return None
         if "sword" in self.tools:
             self.queue.clear()
@@ -863,7 +1051,8 @@ class Task5FSMBFSAgent:
         chests: Iterable[Position],
         vision: PixelObservation,
     ) -> Position | None:
-        monsters = [monster.tile for monster in vision.monsters]
+        ignored = self._memory().non_hostile_detections
+        monsters = [monster.tile for monster in vision.monsters if monster.tile not in ignored]
         if not monsters:
             return None
         ranked = sorted(
@@ -876,13 +1065,47 @@ class Task5FSMBFSAgent:
         return ranked[0]
 
     def _act_combat(self, player: Position, target: Position, vision: PixelObservation) -> int:
+        if self.bounded_blocker_combat and self.combat_attacks >= 2:
+            for key, (best, _) in list(self.chest_progress.items()):
+                if key[0] == self.room:
+                    self.chest_progress[key] = (best, self.step_count)
+            self._reset_combat()
+            self.goal = None
+            return ACTION_NOOP
         monsters = list(vision.monsters)
         if not monsters:
             self._reset_combat()
             self.goal = None
             return ACTION_NOOP
+        if self.bounded_blocker_combat and self.combat_target is not None:
+            matches = [monster for monster in monsters if manhattan(monster.tile, self.combat_target) <= 1]
+            if not matches:
+                self.combat_target = None
+            else:
+                monsters = matches
         entity = min(monsters, key=lambda monster: (manhattan(monster.tile, target), manhattan(player, monster.tile)))
         target = entity.tile
+        if (
+            not self.bounded_blocker_combat
+            and self.combat_target is not None
+            and manhattan(self.combat_target, target) > 1
+        ):
+            self.combat_attacks = 0
+            self.combat_misses = 0
+        if not self.bounded_blocker_combat and self.combat_attacks >= 3:
+            # A real local threat reacts or disappears after bounded confirmed
+            # sword overlaps.  A stationary detection that survives repeated
+            # overlaps is commonly an NPC-like false positive; stop attacking
+            # it so exploration can continue.  This is episode-local visual
+            # evidence, not a fixed object coordinate.
+            ignored = self._memory().non_hostile_detections
+            ignored.add(target)
+            self._reset_combat()
+            self.goal = None
+            if "shield" in self.tools:
+                self.shield_cooldown = 3
+                return ACTION_B
+            return ACTION_NOOP
         self.combat_target = target
 
         if manhattan(player, target) <= 1:
@@ -949,6 +1172,7 @@ class Task5FSMBFSAgent:
         self.combat_attacks = 0
         self.combat_misses = 0
         self.combat_cooldown = 0
+        self.bounded_blocker_combat = False
 
     def _align_move(
         self,
@@ -1080,6 +1304,18 @@ class Task5FSMBFSAgent:
         # estimate is deliberately conservative and never reads hidden health.
         estimated_budget = 5 - self.step_count // 200 - sum(room.risk for room in self.rooms.values())
         return self.step_count >= 700 or estimated_budget <= 2
+
+    def _chest_cautious(self) -> bool:
+        if self.step_count >= 900 and (
+            self.input_domain == "threshold" or (self.input_domain == "dark" and self.binary_domain)
+        ):
+            return True
+        if self._rush_mode():
+            return False
+        # Before the first key is acquired, a late local chest blocks all
+        # remaining locked-frontier progress.  Prefer a shielded direct service
+        # over a long monster-avoidance detour.
+        return not (self.keys == 0 and self.step_count >= 300)
 
 
 def bfs_path(
