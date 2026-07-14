@@ -67,7 +67,7 @@ BLOCKING_KINDS = {
     "wall", "chest", "trap", "abyss", "gap", "monster", "unknown",
 }
 SAFE_WALKABLE_KINDS = {
-    "floor", "player", "bridge", "button", "switch",
+    "floor", "player", "bridge", "button", "button_pressed", "switch",
     "exit_normal", "exit_locked", "exit_conditional", "npc",
 }
 
@@ -113,8 +113,9 @@ class Task4Agent:
     move_action: int | None = None
     move_attempts: int = 0
 
-    # ---- 延迟交互 ----
-    pending_interact: bool = False
+    # ---- 延迟交互：先面向目标，下一帧再真正按 A ----
+    pending_interaction_kind: str | None = None
+    pending_interaction_target: Position | None = None
 
     # ---- 钥匙 / 物品状态 ----
     last_key_count: int = 0
@@ -142,6 +143,13 @@ class Task4Agent:
     # ---- 已交互过的宝箱位置（打开后贴图仍被分类为 chest，需行为记忆绕过） ----
     interacted_positions: set[Position] = field(default_factory=set)
 
+    # ---- 最终宝箱：从南桥开始，最多再转两次覆盖三种桥状态 ----
+    final_chest_state: str = "scan_center"
+    final_bridge_rotations: int = 0
+
+    # ---- 开关是 west 房间内的局部视觉坐标；首次看到后跨房间保留 ----
+    switch_pos: Position | None = None
+
     # ================================================================
     # 公开接口
     # ================================================================
@@ -154,7 +162,8 @@ class Task4Agent:
         self.move_target_tile = None
         self.move_action = None
         self.move_attempts = 0
-        self.pending_interact = False
+        self.pending_interaction_kind = None
+        self.pending_interaction_target = None
         self.last_key_count = 0
         self.key_confirmed = False
         self.has_sword = False
@@ -167,6 +176,9 @@ class Task4Agent:
         self.stuck_player_tile = None
         self.interact_count = 0
         self.interacted_positions.clear()
+        self.final_chest_state = "scan_center"
+        self.final_bridge_rotations = 0
+        self.switch_pos = None
 
     def act(self, obs, info=None) -> int:
         """根据像素观测和允许的物品栏信息输出一个环境动作。"""
@@ -175,6 +187,12 @@ class Task4Agent:
         player = None if vision.player is None else vision.player.tile
         if player is None:
             return ACTION_NOOP
+
+        # 开关按下后 CNN 可能将其识别为 button_pressed。两种贴图都是
+        # 同一个开关，且位置只在 west 房间内复用。
+        visible_switches = self._visible_switch_positions(vision)
+        if visible_switches:
+            self.switch_pos = min(visible_switches)
 
         # ---- 房间切换检测（必须在 last_player_tile 更新前） ----
         prev_tile = self.last_player_tile
@@ -193,13 +211,24 @@ class Task4Agent:
             self._on_stuck()
 
         # ---- 延迟交互 ----
-        if self.pending_interact:
-            self.pending_interact = False
-            # 根据当前 phase 判断交互类型并更新计数器
-            if self.mission_phase == "to_switch":
+        if self.pending_interaction_kind is not None:
+            interaction_kind = self.pending_interaction_kind
+            interaction_target = self.pending_interaction_target
+            self.pending_interaction_kind = None
+            self.pending_interaction_target = None
+
+            # 只在这一帧真正返回 ACTION_A 时更新行为记忆，不在上一帧
+            # 的面向动作中提前确认。
+            if interaction_kind == "switch":
                 self.switch_presses_done += 1
-            elif self.mission_phase == "at_target" and self.mission == 2:
+            elif interaction_kind == "final_switch":
+                self.switch_presses_done += 1
+                self.final_bridge_rotations += 1
+                self.final_chest_state = "return_center"
+            elif interaction_kind == "monster":
                 self.monster_attack_count += 1
+            elif interaction_kind == "chest" and interaction_target is not None:
+                self.interacted_positions.add(interaction_target)
             return ACTION_A
 
         # ---- 像素感知移动：检查是否已到达目标 tile（纯视觉，不读 info） ----
@@ -279,7 +308,8 @@ class Task4Agent:
         self.move_target_tile = None
         self.move_action = None
         self.move_attempts = 0
-        self.pending_interact = False
+        self.pending_interaction_kind = None
+        self.pending_interaction_target = None
         self.exit_push_action = None
         self.target_exit_tile = None
         self.stuck_counter = 0
@@ -289,7 +319,8 @@ class Task4Agent:
         self.move_target_tile = None
         self.move_action = None
         self.move_attempts = 0
-        self.pending_interact = False
+        self.pending_interaction_kind = None
+        self.pending_interaction_target = None
         self.exit_push_action = None
         self.target_exit_tile = None
         self.stuck_counter = 0
@@ -346,20 +377,22 @@ class Task4Agent:
             self.mission_phase = "to_target"
             return ACTION_NOOP
 
-        # 找开关 tile（分类为 "switch"）
-        switch_tiles = self._tiles_of_kind(vision, {"switch"})
-        if not switch_tiles:
-            # 视觉暂时没检测到开关 → 尝试去东出口
-            self.mission_phase = "to_target"
+        # 开关激活前后可分别显示为 switch / button_pressed。短暂漏检时
+        # 使用本局先前从 RGB 中学到的位置，不猜测固定坐标。
+        switch_tiles = self._visible_switch_positions(vision)
+        if switch_tiles:
+            self.switch_pos = min(switch_tiles)
+        if self.switch_pos is None:
             return ACTION_NOOP
 
-        switch_pos = next(iter(switch_tiles))
+        switch_pos = self.switch_pos
 
         # 检查是否在开关旁边
         if manhattan(player, switch_pos) == 1:
             face_action = action_toward(player, switch_pos)
             if face_action is not None:
-                self.pending_interact = True
+                self.pending_interaction_kind = "switch"
+                self.pending_interaction_target = switch_pos
                 self.interact_count += 1
                 return face_action
             self.interact_count += 1
@@ -434,7 +467,7 @@ class Task4Agent:
 
     def _detect_room(self, vision: PixelObservation) -> str:
         """根据视觉特征判断当前房间类型。"""
-        if self._tiles_of_kind(vision, {"switch"}):
+        if self._visible_switch_positions(vision):
             return "west"
         if self._tiles_of_kind(vision, {"bridge"}) or len(self._tiles_of_kind(vision, {"abyss"})) > 10:
             return "center"
@@ -445,25 +478,87 @@ class Task4Agent:
     # ================================================================
 
     def _act_go_final_chest(self, player: Position, vision: PixelObservation) -> int:
-        """杀完南房间怪物后：从南→center→找到并打开最终宝箱。"""
+        """遍历三种旋转桥状态，找到并打开最终宝箱。
+
+        击杀怪物后首先检查当前的南桥；若没看到宝箱，就回 west
+        转桥并依次检查北桥、东桥。所有位置均来自当前 RGB 分类，
+        不使用最终宝箱的预设坐标。
+        """
         room = self._detect_room(vision)
 
-        if room == "target":
-            # 还在南房间 → 去北出口进 center
-            return self._act_exit_directional(player, vision, "north")
-
-        # 在 center（或 west）→ 找宝箱
+        # 任何扫描阶段一旦看到宝箱，立即中断转桥流程并开箱。
         chest_tiles = self._tiles_of_kind(vision, {"chest"})
         if chest_tiles:
             return self._act_open_chest_at(player, vision, chest_tiles)
 
-        # 宝箱还没视觉出现 → 走向 center 中央 (4,4) 等待揭示
-        if player != (4, 4):
-            path = bfs_path(player, {(4, 4)}, vision)
-            if len(path) >= 2:
-                action = action_toward(path[0], path[1])
-                if action is not None:
-                    return self._begin_tile_move(action, path[1])
+        if self.final_chest_state == "scan_center":
+            if room == "target":
+                # 刚杀完南房怪物，先从北出口回到 center 检查南桥。
+                return self._act_exit_directional(player, vision, "north")
+            if room == "west":
+                # 房间切换帧造成的状态滞后：已在 west 时直接进入按开关阶段。
+                self.final_chest_state = "press_switch"
+                return ACTION_NOOP
+
+            # 整幅 center 画面都可见。当前桥没有宝箱时，最多再转两次
+            # 即可覆盖南、北、东三种状态。
+            if self.final_bridge_rotations < 2:
+                self.final_chest_state = "go_west"
+            return ACTION_NOOP
+
+        if self.final_chest_state == "go_west":
+            if room == "target":
+                return self._act_exit_directional(player, vision, "north")
+            if room == "center":
+                return self._act_exit_directional(player, vision, "west")
+            self.final_chest_state = "press_switch"
+            return ACTION_NOOP
+
+        if self.final_chest_state == "press_switch":
+            if room == "center":
+                self.final_chest_state = "go_west"
+                return ACTION_NOOP
+            if room == "target":
+                return self._act_exit_directional(player, vision, "north")
+            return self._act_final_switch(player, vision)
+
+        if self.final_chest_state == "return_center":
+            if room == "west":
+                return self._act_exit_directional(player, vision, "east")
+            if room == "center":
+                self.final_chest_state = "scan_center"
+                return ACTION_NOOP
+            return self._act_exit_directional(player, vision, "north")
+
+        return ACTION_NOOP
+
+    def _act_final_switch(self, player: Position, vision: PixelObservation) -> int:
+        """在最终宝箱扫描阶段转动一次桥。
+
+        开关的环境交互规则是“玩家在相邻格按 A”，因此 BFS 目标是
+        开关的可通行相邻格，而不是将玩家移入开关格。
+        """
+        switch_tiles = self._visible_switch_positions(vision)
+        if switch_tiles:
+            self.switch_pos = min(switch_tiles)
+        if self.switch_pos is None:
+            return ACTION_NOOP
+
+        if manhattan(player, self.switch_pos) == 1:
+            face_action = action_toward(player, self.switch_pos)
+            if face_action is not None:
+                self.pending_interaction_kind = "final_switch"
+                self.pending_interaction_target = self.switch_pos
+                self.interact_count += 1
+                return face_action
+            return ACTION_NOOP
+
+        adjacent = self._adjacent_positions({self.switch_pos}, vision)
+        path = bfs_path(player, adjacent, vision)
+        if len(path) >= 2:
+            action = action_toward(path[0], path[1])
+            if action is not None:
+                return self._begin_tile_move(action, path[1])
         return ACTION_NOOP
 
     # ================================================================
@@ -490,11 +585,10 @@ class Task4Agent:
         adjacent = self._adjacent_positions(chest_tiles, vision)
         if player in adjacent:
             chest = min(chest_tiles, key=lambda t: manhattan(player, t))
-            # ★ 标记为已交互：即使宝箱贴图仍在，下次不再尝试
-            self.interacted_positions.add(chest)
             face_action = action_toward(player, chest)
             if face_action is not None:
-                self.pending_interact = True
+                self.pending_interaction_kind = "chest"
+                self.pending_interaction_target = chest
                 return face_action
             return ACTION_A
 
@@ -515,6 +609,9 @@ class Task4Agent:
 
         if not monster_tiles:
             # 怪物已死 → mission 2 直接去找最终宝箱，不回 west
+            self.mission = 3
+            self.final_chest_state = "scan_center"
+            self.final_bridge_rotations = 0
             if self.monster_was_visible:
                 self.mission_phase = "go_final_chest"
                 return ACTION_NOOP
@@ -529,7 +626,8 @@ class Task4Agent:
                 # 相邻 → 攻击
                 face_action = action_toward(player, mt)
                 if face_action is not None:
-                    self.pending_interact = True
+                    self.pending_interaction_kind = "monster"
+                    self.pending_interaction_target = mt
                     return face_action
                 return ACTION_A
 
@@ -644,7 +742,7 @@ class Task4Agent:
 
         # 允许贴近交互目标（宝箱、开关、怪物）
         nxt_kind = vision.grid[nxt[1]][nxt[0]]
-        if nxt_kind in ("chest", "switch", "monster"):
+        if nxt_kind in ("chest", "switch", "button_pressed", "monster"):
             return action
 
         if not is_walkable(nxt, vision):
@@ -657,6 +755,22 @@ class Task4Agent:
 
     def _tiles_of_kind(self, vision: PixelObservation, kinds: set[str]) -> set[Position]:
         return {tile.tile for tile in vision.tiles if tile.kind in kinds}
+
+    def _visible_switch_positions(self, vision: PixelObservation) -> set[Position]:
+        """返回有时序依据支持的开关位置。
+
+        CNN 在反色画面中偶尔会把已打开的宝箱识别为
+        ``button_pressed``。因此 ``switch`` 可以建立新的位置记忆，
+        ``button_pressed`` 则只能确认已经由 switch 帧学到的同一位置。
+        这样既支持开关按下后的贴图变化，也不会让单帧误报
+        改写房间识别。
+        """
+        positions = self._tiles_of_kind(vision, {"switch"})
+        if self.switch_pos is not None:
+            pressed = self._tiles_of_kind(vision, {"button_pressed"})
+            if self.switch_pos in pressed:
+                positions.add(self.switch_pos)
+        return positions
 
     def _adjacent_positions(
         self, positions: set[Position], vision: PixelObservation
