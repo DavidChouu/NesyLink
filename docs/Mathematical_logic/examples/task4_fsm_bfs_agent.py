@@ -1,25 +1,12 @@
-"""任务 4 的像素识别 + 多 Mission FSM + BFS 策略 —— 旋转桥、拿钥匙剑、杀怪、开最终宝箱。
+"""Task 4 的观测驱动像素策略。
 
-整体思路：
+策略不预设钥匙、剑、怪物或最终宝箱所在方向，也不记忆固定
+物体坐标。它仅根据当前 RGB 的 CNN 分类、允许的物品栏以及已经
+亲自验证的换房结果，动态建立匿名房间图并服务当前可达目标。
 
-1. 与 task1/2/3 相同，策略推理阶段只使用原始 RGB 图像 obs 和课程允许的显式物品栏信息。
-2. 任务 4 是 5 房间十字结构 + 旋转桥：
-      west (起点, 有开关) → center (旋转桥 + 深渊 + 隐藏最终宝箱)
-      → north (钥匙宝箱) / east (剑宝箱, 需钥匙) / south (怪物)
-   玩家初始无剑（slot A = none），必须按顺序完成：
-     ① 北房间拿钥匙 → ② 东房间拿剑 → ③ 南房间杀怪 → ④ center 开最终宝箱
-3. 旋转桥有 3 个状态（west_to_north → west_to_east → west_to_south），
-   按 west 房间的开关可循环切换。桥 tile 分类为 "bridge"（可通过），
-   其余 center 房间全是 "abyss"（不可通过）。BFS 自然只沿桥走，
-   桥状态不对时 BFS 找不到路 → agent 回 west 再按一次开关。
-4. 房间切换检测与 task3 相同（tile 跳跃 > 3）。
-5. 使用像素感知移动（与 task2/task3 一致）。
-
-Mission 序列：
-   mission 0: 北拿钥匙  桥=west_to_north (0 presses)  目标：north 宝箱 → 返回 west
-   mission 1: 东拿剑    桥=west_to_east  (1 press)    目标：east 宝箱（需钥匙）→ 返回 west
-   mission 2: 南杀怪    桥=west_to_south (2 presses)  目标：south 怪物(hp=1)
-             → 杀完直接北出口回 center → 开最终宝箱 → 完成！
+旋转桥状态由桥 tile 抵达的边界方向集合作为视觉指纹。当前桥没有
+可服务分支时，Agent 回到已发现的机关房转桥，然后继续探索；代码
+不知道桥有几种状态或它们的循环顺序。
 """
 
 from __future__ import annotations
@@ -48,11 +35,9 @@ from nesylink.core.constants import (
 from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
-# ============================================================================
-# 类型别名 & 常量
-# ============================================================================
-
 Position = tuple[int, int]
+RoomId = int
+BridgeFingerprint = frozenset[str]
 
 MOVE_ACTIONS = (ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT)
 ACTION_TO_DELTA = {
@@ -62,624 +47,411 @@ ACTION_TO_DELTA = {
     ACTION_RIGHT: (1, 0),
 }
 DELTA_TO_ACTION = {delta: action for action, delta in ACTION_TO_DELTA.items()}
-
-BLOCKING_KINDS = {
-    "wall", "chest", "trap", "abyss", "gap", "monster", "unknown",
+DIRECTION_ACTION = {
+    "north": ACTION_UP,
+    "south": ACTION_DOWN,
+    "west": ACTION_LEFT,
+    "east": ACTION_RIGHT,
 }
+OPPOSITE = {"north": "south", "south": "north", "west": "east", "east": "west"}
+EXIT_KINDS = {"exit_normal", "exit_locked", "exit_conditional"}
+BLOCKING_KINDS = {"wall", "chest", "trap", "abyss", "gap", "monster", "unknown"}
 SAFE_WALKABLE_KINDS = {
-    "floor", "player", "bridge", "button", "button_pressed", "switch",
-    "exit_normal", "exit_locked", "exit_conditional", "npc",
+    "floor",
+    "player",
+    "bridge",
+    "button",
+    "button_pressed",
+    "switch",
+    "exit_normal",
+    "exit_locked",
+    "exit_conditional",
+    "npc",
 }
-
 ROOM_TRANSITION_THRESHOLD = 3
-MAX_TILE_MOVE_ATTEMPTS = TILE_SIZE * 5  # 80
-
-# 每趟 mission 需要的桥状态 → 需要按几次开关（累计）
-MISSION_SWITCH_PRESSES = [0, 1, 2]  # mission 0=north, 1=east, 2=south
-
-# 每趟 mission 的目标出口方向（从 center 出发）
-MISSION_EXIT_DIRECTION = ["north", "east", "south"]
-
-# 每趟 mission 的返回方向（从目标房间回 center）
-# mission 2 不返回 west——杀完怪直接去 center 开最终宝箱
-MISSION_RETURN_DIRECTION = ["south", "west", None]
+MAX_TILE_MOVE_ATTEMPTS = TILE_SIZE * 5
 
 
-# ============================================================================
-# Agent 主体
-# ============================================================================
+@dataclass
+class RoomMemory:
+    """一个由实际换房创建的匿名房间节点。"""
+
+    kind: str = "unknown"
+    entry_direction: str | None = None
+    connections: dict[str, RoomId] = field(default_factory=dict)
+    exits: set[str] = field(default_factory=set)
+    exit_kinds: dict[str, str] = field(default_factory=dict)
+    chests: set[Position] = field(default_factory=set)
+    opened_chests: set[Position] = field(default_factory=set)
+    switch_pos: Position | None = None
+    monster_seen: bool = False
+    monster_cleared: bool = False
+    bridge_modes: dict[BridgeFingerprint, int] = field(default_factory=dict)
+    current_bridge_mode: BridgeFingerprint = frozenset()
 
 
 @dataclass
 class Task4Agent:
-    """Task 4 像素识别 + Mission FSM + BFS + 像素感知移动 + safety shield 策略。
+    """RGB + 匿名房间图 + 动态桥指纹 + BFS 策略。"""
 
-    Mission 序列：
-      0: 北拿钥匙 → 返回 west
-      1: 东拿剑   → 返回 west
-      2: 南杀怪   → 直接 center 开最终宝箱
-    """
+    current_room: RoomId = 0
+    next_room_id: RoomId = 1
+    rooms: dict[RoomId, RoomMemory] = field(default_factory=lambda: {0: RoomMemory()})
+    world_revision: int = 0
 
-    # ---- Mission 追踪 ----
-    mission: int = 0
-    # 子阶段: "to_switch" | "to_target" | "at_target" | "return_to_west" | "go_final_chest"
-    mission_phase: str = "to_switch"
+    keys: int = 0
+    has_sword: bool = False
+    inventory_revision: int = 0
 
-    # ---- 开关按次数 ----
-    switch_presses_done: int = 0
-
-    # ---- 像素感知移动（纯视觉：用 vision.player.tile 判断到达） ----
+    last_player_tile: Position | None = None
     move_target_tile: Position | None = None
     move_action: int | None = None
     move_attempts: int = 0
-
-    # ---- 延迟交互：先面向目标，下一帧再真正按 A ----
-    pending_interaction_kind: str | None = None
-    pending_interaction_target: Position | None = None
-
-    # ---- 钥匙 / 物品状态 ----
-    last_key_count: int = 0
-    key_confirmed: bool = False
-    has_sword: bool = False  # 初始 slot A = none
-
-    # ---- 出口推进 ----
     exit_push_action: int | None = None
     target_exit_tile: Position | None = None
+    pending_exit_direction: str | None = None
 
-    # ---- 房间切换检测 ----
-    last_player_tile: Position | None = None
-
-    # ---- 怪物攻击 ----
-    monster_attack_count: int = 0
-    monster_was_visible: bool = False
-
-    # ---- 卡住检测 ----
+    pending_interaction_kind: str | None = None
+    pending_interaction_target: Position | None = None
+    awaiting_monster_result: bool = False
+    depart_after_switch: bool = False
     stuck_counter: int = 0
-    stuck_player_tile: Position | None = None
-
-    # ---- 宝箱/开关交互计数 ----
-    interact_count: int = 0
-
-    # ---- 已交互过的宝箱位置（打开后贴图仍被分类为 chest，需行为记忆绕过） ----
-    interacted_positions: set[Position] = field(default_factory=set)
-
-    # ---- 最终宝箱：从南桥开始，最多再转两次覆盖三种桥状态 ----
-    final_chest_state: str = "scan_center"
-    final_bridge_rotations: int = 0
-
-    # ---- 开关是 west 房间内的局部视觉坐标；首次看到后跨房间保留 ----
-    switch_pos: Position | None = None
-
-    # ================================================================
-    # 公开接口
-    # ================================================================
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
+        """彻底清空局内学习结果；seed 和 task_id 不参与决策。"""
         del seed, task_id
-        self.mission = 0
-        self.mission_phase = "to_switch"
-        self.switch_presses_done = 0
-        self.move_target_tile = None
-        self.move_action = None
-        self.move_attempts = 0
+        self.current_room = 0
+        self.next_room_id = 1
+        self.rooms = {0: RoomMemory()}
+        self.world_revision = 0
+        self.keys = 0
+        self.has_sword = False
+        self.inventory_revision = 0
+        self.last_player_tile = None
+        self._clear_motion()
         self.pending_interaction_kind = None
         self.pending_interaction_target = None
-        self.last_key_count = 0
-        self.key_confirmed = False
-        self.has_sword = False
-        self.exit_push_action = None
-        self.target_exit_tile = None
-        self.last_player_tile = None
-        self.monster_attack_count = 0
-        self.monster_was_visible = False
+        self.awaiting_monster_result = False
+        self.depart_after_switch = False
         self.stuck_counter = 0
-        self.stuck_player_tile = None
-        self.interact_count = 0
-        self.interacted_positions.clear()
-        self.final_chest_state = "scan_center"
-        self.final_bridge_rotations = 0
-        self.switch_pos = None
 
     def act(self, obs, info=None) -> int:
-        """根据像素观测和允许的物品栏信息输出一个环境动作。"""
-        self._update_inventory_progress(info)
-        vision = classify_frame_cnn(obs, fallback=False)
-        player = None if vision.player is None else vision.player.tile
-        if player is None:
+        """根据当前 RGB 与 safe inventory 返回 0..6 的动作。"""
+        self._update_inventory(info)
+        try:
+            vision = classify_frame_cnn(obs, fallback=False)
+        except Exception:
             return ACTION_NOOP
+        if vision.player is None:
+            return ACTION_NOOP
+        player = vision.player.tile
 
-        # 开关按下后 CNN 可能将其识别为 button_pressed。两种贴图都是
-        # 同一个开关，且位置只在 west 房间内复用。
-        visible_switches = self._visible_switch_positions(vision)
-        if visible_switches:
-            self.switch_pos = min(visible_switches)
-
-        # ---- 房间切换检测（必须在 last_player_tile 更新前） ----
-        prev_tile = self.last_player_tile
-        if prev_tile is not None:
-            dist = manhattan(player, prev_tile)
-            if dist > ROOM_TRANSITION_THRESHOLD:
-                self._on_room_change()
+        previous = self.last_player_tile
+        if previous is not None and manhattan(player, previous) > ROOM_TRANSITION_THRESHOLD:
+            self._confirm_room_change()
         self.last_player_tile = player
 
-        # ---- 卡住检测 ----
-        if prev_tile == player:
+        self._observe_room(vision)
+
+        if previous == player:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
         if self.stuck_counter > MAX_TILE_MOVE_ATTEMPTS * 3:
-            self._on_stuck()
+            self._clear_motion()
+            self.stuck_counter = 0
 
-        # ---- 延迟交互 ----
         if self.pending_interaction_kind is not None:
-            interaction_kind = self.pending_interaction_kind
-            interaction_target = self.pending_interaction_target
+            kind = self.pending_interaction_kind
+            target = self.pending_interaction_target
             self.pending_interaction_kind = None
             self.pending_interaction_target = None
-
-            # 只在这一帧真正返回 ACTION_A 时更新行为记忆，不在上一帧
-            # 的面向动作中提前确认。
-            if interaction_kind == "switch":
-                self.switch_presses_done += 1
-            elif interaction_kind == "final_switch":
-                self.switch_presses_done += 1
-                self.final_bridge_rotations += 1
-                self.final_chest_state = "return_center"
-            elif interaction_kind == "monster":
-                self.monster_attack_count += 1
-            elif interaction_kind == "chest" and interaction_target is not None:
-                self.interacted_positions.add(interaction_target)
+            memory = self._memory()
+            if kind == "chest" and target is not None:
+                memory.opened_chests.add(target)
+                self.world_revision += 1
+            elif kind == "switch":
+                self.depart_after_switch = True
+            elif kind == "monster":
+                self.awaiting_monster_result = True
             return ACTION_A
 
-        # ---- 像素感知移动：检查是否已到达目标 tile（纯视觉，不读 info） ----
-        if self.move_target_tile is not None and self.move_action is not None:
-            self.move_attempts += 1
-            if player == self.move_target_tile:
-                # 视觉确认已到达目标 tile
-                self.move_target_tile = None
-                self.move_action = None
-                self.move_attempts = 0
-            elif self.move_attempts >= MAX_TILE_MOVE_ATTEMPTS:
-                # 超时 → 放弃重规划
-                self.move_target_tile = None
-                self.move_action = None
-                self.move_attempts = 0
-            else:
-                align_action = self._boundary_alignment_action(vision)
-                if align_action is not None:
-                    return self._shield_action(align_action, vision)
-                return self._shield_action(self.move_action, vision)
+        continued = self._continue_motion(player, vision)
+        if continued is not None:
+            return self._safe_action(continued, vision)
 
-        # ---- 按 mission + phase 决策 ----
-        action = self._act_by_mission(player, vision)
-        return self._shield_action(action, vision)
+        action = self._choose_action(player, vision)
+        return self._safe_action(action, vision)
 
-    # ================================================================
-    # 像素感知移动（纯视觉：用 classify_frame 的 player.tile 判断到达）
-    # ================================================================
+    def _memory(self) -> RoomMemory:
+        """取得当前匿名房间记忆。"""
+        return self.rooms[self.current_room]
 
-    def _begin_tile_move(self, action: int, target_tile: Position) -> int:
-        """开始朝目标 tile 移动，视觉确认到达时自动停止。"""
-        self.move_target_tile = target_tile
-        self.move_action = action
-        self.move_attempts = 0
-        return action
-
-    def _boundary_alignment_action(self, vision: PixelObservation) -> int | None:
-        """Before pushing through edge exits, align the perpendicular pixel axis.
-
-        A player can be classified into the correct tile while its sprite still
-        overlaps the neighboring wall row/column. Aligning the center prevents
-        corner collision from blocking the exit push.
-        """
-
-        if self.move_target_tile is None or self.move_action is None or vision.player is None:
-            return None
-        target_x, target_y = self.move_target_tile
-        center_x, center_y = vision.player.center_px
-        tolerance = 0.5
-
-        if target_x in {0, GRID_WIDTH - 1} and self.move_action in {ACTION_LEFT, ACTION_RIGHT}:
-            desired_y = target_y * TILE_SIZE + TILE_SIZE * 0.5
-            if center_y < desired_y - tolerance:
-                return ACTION_DOWN
-            if center_y > desired_y + tolerance:
-                return ACTION_UP
-
-        if target_y in {0, GRID_HEIGHT - 1} and self.move_action in {ACTION_UP, ACTION_DOWN}:
-            desired_x = target_x * TILE_SIZE + TILE_SIZE * 0.5
-            if center_x < desired_x - tolerance:
-                return ACTION_RIGHT
-            if center_x > desired_x + tolerance:
-                return ACTION_LEFT
-        return None
-
-    # ================================================================
-    # 房间切换 & 卡住处理
-    # ================================================================
-
-    def _on_room_change(self) -> None:
-        """房间切换时只重置局部状态，不改变 phase。
-
-        Phase 的推进由各 phase handler 根据当前房间的视觉特征自行判断。
-        因为 to_target 和 return_to_west 都需要跨越两个房间（west→center→目标），
-        不能在每次房间切换时盲目推进。
-        """
-        self.move_target_tile = None
-        self.move_action = None
-        self.move_attempts = 0
-        self.pending_interaction_kind = None
-        self.pending_interaction_target = None
-        self.exit_push_action = None
-        self.target_exit_tile = None
-        self.stuck_counter = 0
-
-    def _on_stuck(self) -> None:
-        """卡住时重置所有移动状态。"""
-        self.move_target_tile = None
-        self.move_action = None
-        self.move_attempts = 0
-        self.pending_interaction_kind = None
-        self.pending_interaction_target = None
-        self.exit_push_action = None
-        self.target_exit_tile = None
-        self.stuck_counter = 0
-
-    # ================================================================
-    # 物品栏追踪
-    # ================================================================
-
-    def _update_inventory_progress(self, info) -> None:
-        """追踪钥匙数量和是否获得了剑。"""
-        keys = inventory_key_count(info)
-        if keys is not None:
-            if keys > self.last_key_count or keys > 0:
-                self.key_confirmed = True
-            self.last_key_count = max(self.last_key_count, keys)
-
-        # 检测剑：检查 equipped slot A
-        if not self.has_sword and isinstance(info, dict):
-            inventory = info.get("inventory")
-            if isinstance(inventory, dict):
-                equipped = inventory.get("equipped")
-                if isinstance(equipped, dict):
-                    if equipped.get("A") == "sword":
-                        self.has_sword = True
-
-    # ================================================================
-    # Mission 决策分发
-    # ================================================================
-
-    def _act_by_mission(self, player: Position, vision: PixelObservation) -> int:
-        """根据当前 mission + phase 决策。"""
-        if self.mission_phase == "to_switch":
-            return self._act_press_switch(player, vision)
-        elif self.mission_phase == "to_target":
-            return self._act_go_to_target(player, vision)
-        elif self.mission_phase == "at_target":
-            return self._act_at_target(player, vision)
-        elif self.mission_phase == "return_to_west":
-            return self._act_return_to_west(player, vision)
-        elif self.mission_phase == "go_final_chest":
-            return self._act_go_final_chest(player, vision)
-        return ACTION_NOOP
-
-    # ================================================================
-    # Phase: to_switch —— 在 west 房间按开关
-    # ================================================================
-
-    def _act_press_switch(self, player: Position, vision: PixelObservation) -> int:
-        """在 west 房间找到开关并按到需要的次数。"""
-        needed = MISSION_SWITCH_PRESSES[self.mission]
-
-        if self.switch_presses_done >= needed:
-            # 开关已按够 → 去东出口进 center
-            self.mission_phase = "to_target"
-            return ACTION_NOOP
-
-        # 开关激活前后可分别显示为 switch / button_pressed。短暂漏检时
-        # 使用本局先前从 RGB 中学到的位置，不猜测固定坐标。
-        switch_tiles = self._visible_switch_positions(vision)
-        if switch_tiles:
-            self.switch_pos = min(switch_tiles)
-        if self.switch_pos is None:
-            return ACTION_NOOP
-
-        switch_pos = self.switch_pos
-
-        # 检查是否在开关旁边
-        if manhattan(player, switch_pos) == 1:
-            face_action = action_toward(player, switch_pos)
-            if face_action is not None:
-                self.pending_interaction_kind = "switch"
-                self.pending_interaction_target = switch_pos
-                self.interact_count += 1
-                return face_action
-            self.interact_count += 1
-            return ACTION_A
-
-        # BFS 到开关旁边
-        adjacent = self._adjacent_positions({switch_pos}, vision)
-        path = bfs_path(player, adjacent, vision)
-        if len(path) >= 2:
-            action = action_toward(path[0], path[1])
-            if action is not None:
-                return self._begin_tile_move(action, path[1])
-        return ACTION_NOOP
-
-    # ================================================================
-    # Phase: to_target —— 从 west 穿越 center 去目标房间
-    # ================================================================
-
-    def _act_go_to_target(self, player: Position, vision: PixelObservation) -> int:
-        """穿越 center 去目标房间。根据视觉判断当前在哪个房间。"""
-        room = self._detect_room(vision)
-
-        if room == "west":
-            # 还在 west → 去东出口进入 center
-            return self._act_exit_directional(player, vision, "east")
-        elif room == "center":
-            # 在 center → 导航到目标出口
-            direction = MISSION_EXIT_DIRECTION[self.mission]
-            return self._act_exit_directional(player, vision, direction)
-        else:
-            # 已到达目标房间（north/east/south）
-            self.mission_phase = "at_target"
-            return ACTION_NOOP
-
-    # ================================================================
-    # Phase: at_target —— 在目标房间完成任务
-    # ================================================================
-
-    def _act_at_target(self, player: Position, vision: PixelObservation) -> int:
-        """在目标房间完成子任务（开宝箱 / 杀怪物）。"""
-        if self.mission == 0:
-            # 北房间：开钥匙宝箱
-            return self._act_open_chest(player, vision)
-        elif self.mission == 1:
-            # 东房间：开剑宝箱
-            return self._act_open_chest(player, vision)
-        elif self.mission == 2:
-            # 南房间：杀怪物
-            return self._act_kill_monster(player, vision)
-        return ACTION_NOOP
-
-    # ================================================================
-    # Phase: return_to_west —— 从目标房间穿越 center 回 west
-    # ================================================================
-
-    def _act_return_to_west(self, player: Position, vision: PixelObservation) -> int:
-        """从目标房间穿越 center 回 west。根据视觉判断当前在哪个房间。"""
-        room = self._detect_room(vision)
-
-        if room == "west":
-            # 已回到 west → 进入下一 mission（mission 2 不会走到这里）
-            self.mission += 1
-            self.mission_phase = "to_switch"
-            return ACTION_NOOP
-        elif room == "center":
-            # 在 center → 找 west 出口回 west
-            return self._act_exit_directional(player, vision, "west")
-        else:
-            # 在目标房间 → 找返回出口回 center
-            ret_dir = MISSION_RETURN_DIRECTION[self.mission]
-            return self._act_exit_directional(player, vision, ret_dir)
-
-    def _detect_room(self, vision: PixelObservation) -> str:
-        """根据视觉特征判断当前房间类型。"""
-        if self._visible_switch_positions(vision):
-            return "west"
-        if self._tiles_of_kind(vision, {"bridge"}) or len(self._tiles_of_kind(vision, {"abyss"})) > 10:
-            return "center"
-        return "target"
-
-    # ================================================================
-    # Phase: go_final_chest —— 杀完南怪物后直接去 center 开最终宝箱
-    # ================================================================
-
-    def _act_go_final_chest(self, player: Position, vision: PixelObservation) -> int:
-        """遍历三种旋转桥状态，找到并打开最终宝箱。
-
-        击杀怪物后首先检查当前的南桥；若没看到宝箱，就回 west
-        转桥并依次检查北桥、东桥。所有位置均来自当前 RGB 分类，
-        不使用最终宝箱的预设坐标。
-        """
-        room = self._detect_room(vision)
-
-        # 任何扫描阶段一旦看到宝箱，立即中断转桥流程并开箱。
-        chest_tiles = self._tiles_of_kind(vision, {"chest"})
-        if chest_tiles:
-            return self._act_open_chest_at(player, vision, chest_tiles)
-
-        if self.final_chest_state == "scan_center":
-            if room == "target":
-                # 刚杀完南房怪物，先从北出口回到 center 检查南桥。
-                return self._act_exit_directional(player, vision, "north")
-            if room == "west":
-                # 房间切换帧造成的状态滞后：已在 west 时直接进入按开关阶段。
-                self.final_chest_state = "press_switch"
-                return ACTION_NOOP
-
-            # 整幅 center 画面都可见。当前桥没有宝箱时，最多再转两次
-            # 即可覆盖南、北、东三种状态。
-            if self.final_bridge_rotations < 2:
-                self.final_chest_state = "go_west"
-            return ACTION_NOOP
-
-        if self.final_chest_state == "go_west":
-            if room == "target":
-                return self._act_exit_directional(player, vision, "north")
-            if room == "center":
-                return self._act_exit_directional(player, vision, "west")
-            self.final_chest_state = "press_switch"
-            return ACTION_NOOP
-
-        if self.final_chest_state == "press_switch":
-            if room == "center":
-                self.final_chest_state = "go_west"
-                return ACTION_NOOP
-            if room == "target":
-                return self._act_exit_directional(player, vision, "north")
-            return self._act_final_switch(player, vision)
-
-        if self.final_chest_state == "return_center":
-            if room == "west":
-                return self._act_exit_directional(player, vision, "east")
-            if room == "center":
-                self.final_chest_state = "scan_center"
-                return ACTION_NOOP
-            return self._act_exit_directional(player, vision, "north")
-
-        return ACTION_NOOP
-
-    def _act_final_switch(self, player: Position, vision: PixelObservation) -> int:
-        """在最终宝箱扫描阶段转动一次桥。
-
-        开关的环境交互规则是“玩家在相邻格按 A”，因此 BFS 目标是
-        开关的可通行相邻格，而不是将玩家移入开关格。
-        """
-        switch_tiles = self._visible_switch_positions(vision)
-        if switch_tiles:
-            self.switch_pos = min(switch_tiles)
-        if self.switch_pos is None:
-            return ACTION_NOOP
-
-        if manhattan(player, self.switch_pos) == 1:
-            face_action = action_toward(player, self.switch_pos)
-            if face_action is not None:
-                self.pending_interaction_kind = "final_switch"
-                self.pending_interaction_target = self.switch_pos
-                self.interact_count += 1
-                return face_action
-            return ACTION_NOOP
-
-        adjacent = self._adjacent_positions({self.switch_pos}, vision)
-        path = bfs_path(player, adjacent, vision)
-        if len(path) >= 2:
-            action = action_toward(path[0], path[1])
-            if action is not None:
-                return self._begin_tile_move(action, path[1])
-        return ACTION_NOOP
-
-    # ================================================================
-    # 共享行为：开宝箱
-    # ================================================================
-
-    def _act_open_chest(self, player: Position, vision: PixelObservation) -> int:
-        """导航到宝箱旁边并打开。用行为记忆区分开/关宝箱。"""
-        chest_tiles = self._tiles_of_kind(vision, {"chest"})
-
-        # 过滤掉已经交互过的宝箱（打开后贴图仍在，但不应再尝试）
-        unopened = chest_tiles - self.interacted_positions
-
-        if not unopened:
-            # 所有可见宝箱都已交互过 → 返回
-            self.mission_phase = "return_to_west"
-            return ACTION_NOOP
-        return self._act_open_chest_at(player, vision, unopened)
-
-    def _act_open_chest_at(
-        self, player: Position, vision: PixelObservation, chest_tiles: set[Position]
-    ) -> int:
-        """在已知宝箱位置的情况下导航并打开。"""
-        adjacent = self._adjacent_positions(chest_tiles, vision)
-        if player in adjacent:
-            chest = min(chest_tiles, key=lambda t: manhattan(player, t))
-            face_action = action_toward(player, chest)
-            if face_action is not None:
-                self.pending_interaction_kind = "chest"
-                self.pending_interaction_target = chest
-                return face_action
-            return ACTION_A
-
-        path = bfs_path(player, adjacent, vision)
-        if len(path) >= 2:
-            action = action_toward(path[0], path[1])
-            if action is not None:
-                return self._begin_tile_move(action, path[1])
-        return ACTION_NOOP
-
-    # ================================================================
-    # 共享行为：杀怪物
-    # ================================================================
-
-    def _act_kill_monster(self, player: Position, vision: PixelObservation) -> int:
-        """在南房间找到并击杀怪物（hp=1）。击杀后自动切换到 return_to_west。"""
-        monster_tiles = {m.tile for m in vision.monsters}
-
-        if not monster_tiles:
-            # 怪物已死 → mission 2 直接去找最终宝箱，不回 west
-            self.mission = 3
-            self.final_chest_state = "scan_center"
-            self.final_bridge_rotations = 0
-            if self.monster_was_visible:
-                self.mission_phase = "go_final_chest"
-                return ACTION_NOOP
-            self.mission_phase = "go_final_chest"
-            return ACTION_NOOP
-
-        self.monster_was_visible = True
-
-        # 检查是否相邻
-        for mt in monster_tiles:
-            if manhattan(player, mt) == 1:
-                # 相邻 → 攻击
-                face_action = action_toward(player, mt)
-                if face_action is not None:
-                    self.pending_interaction_kind = "monster"
-                    self.pending_interaction_target = mt
-                    return face_action
-                return ACTION_A
-
-        # BFS 到怪物旁边
-        adjacent = self._adjacent_positions(monster_tiles, vision)
-        path = bfs_path(player, adjacent, vision)
-        if len(path) >= 2:
-            action = action_toward(path[0], path[1])
-            if action is not None:
-                return self._begin_tile_move(action, path[1])
-        return ACTION_NOOP
-
-    # ================================================================
-    # 共享行为：方向性出口
-    # ================================================================
-
-    def _act_exit_directional(
-        self, player: Position, vision: PixelObservation, direction: str
-    ) -> int:
-        """导航到指定方向边界出口并推出房间。"""
-        exit_tiles = self._tiles_of_kind(
-            vision, {"exit_locked", "exit_normal", "exit_conditional"}
+    def _update_inventory(self, info) -> None:
+        """仅从允许的 inventory 更新钥匙和剑状态。"""
+        if not isinstance(info, dict) or not isinstance(info.get("inventory"), dict):
+            return
+        inventory = info["inventory"]
+        old = (self.keys, self.has_sword)
+        try:
+            self.keys = max(0, int(inventory.get("keys", self.keys) or 0))
+        except (TypeError, ValueError):
+            pass
+        tools = inventory.get("tools", ())
+        items = inventory.get("items", ())
+        equipped = inventory.get("equipped", {})
+        self.has_sword = (
+            "sword" in tools
+            or "sword" in items
+            or (isinstance(equipped, dict) and equipped.get("A") == "sword")
         )
-        filtered = self._filter_exits_by_boundary(exit_tiles, direction)
+        if old != (self.keys, self.has_sword):
+            self.inventory_revision += 1
+            self.world_revision += 1
 
-        # ★ Fallback：桥/深渊/墙等复杂背景下，exit 可能被视觉漏掉。
-        # 此时把目标边界上所有 walkable tile 当作候选（如 bridge tile 上的锁门）。
-        if not filtered:
-            all_boundary = _boundary_tiles(direction)
-            filtered = {t for t in all_boundary if is_walkable(t, vision)}
+    def _observe_room(self, vision: PixelObservation) -> None:
+        """将当前画面合并到房间记忆，不使用房间真值。"""
+        memory = self._memory()
+        raw_switches = self._tiles_of_kind(vision, {"switch"})
+        pressed = self._tiles_of_kind(vision, {"button_pressed"})
+        if raw_switches:
+            memory.switch_pos = min(raw_switches)
+            memory.kind = "switch"
+        elif memory.switch_pos is not None and memory.switch_pos in pressed:
+            memory.kind = "switch"
 
-        reachable = {t for t in filtered if is_walkable(t, vision)}
+        bridges = self._tiles_of_kind(vision, {"bridge"})
+        abyss_count = len(self._tiles_of_kind(vision, {"abyss"}))
+        if bridges or abyss_count > GRID_WIDTH:
+            memory.kind = "hub"
+        elif memory.kind == "unknown":
+            memory.kind = "leaf"
 
+        memory.chests.update(self._tiles_of_kind(vision, {"chest"}))
+        monsters_visible = bool(vision.monsters)
+        if monsters_visible:
+            memory.monster_seen = True
+            memory.monster_cleared = False
+        elif memory.monster_seen and self.awaiting_monster_result:
+            memory.monster_cleared = True
+            self.awaiting_monster_result = False
+            self.world_revision += 1
+
+        for tile in vision.tiles:
+            if tile.kind not in EXIT_KINDS or not is_boundary_tile(tile.tile):
+                continue
+            for direction in boundary_directions(tile.tile):
+                memory.exits.add(direction)
+                memory.exit_kinds[direction] = tile.kind
+        for pos in bridges:
+            for direction in boundary_directions(pos):
+                memory.exits.add(direction)
+
+        if memory.kind == "hub":
+            # CNN 对桥面本身的类别置信度可低于出口，因此桥状态不仅
+            # 依赖 "bridge" 标签，而是用边界上确实可通行的方向集合建立
+            # 视觉指纹。深渊方向没有可通行边界格，不会进入指纹。
+            fingerprint = frozenset(
+                direction
+                for direction in DIRECTION_ACTION
+                if any(is_walkable(pos, vision) for pos in boundary_tiles(direction))
+            )
+            memory.current_bridge_mode = fingerprint
+            memory.bridge_modes[fingerprint] = self.world_revision
+
+    def _confirm_room_change(self) -> None:
+        """仅在边界推进后玩家 tile 跨越时建立双向房间连接。"""
+        old_id = self.current_room
+        direction = self.pending_exit_direction
+        old = self.rooms[old_id]
+        if direction is None:
+            new_id = self.next_room_id
+            self.next_room_id += 1
+            self.rooms[new_id] = RoomMemory()
+        elif direction in old.connections:
+            new_id = old.connections[direction]
+        else:
+            new_id = self.next_room_id
+            self.next_room_id += 1
+            self.rooms[new_id] = RoomMemory(entry_direction=OPPOSITE[direction])
+            old.connections[direction] = new_id
+            self.rooms[new_id].connections[OPPOSITE[direction]] = old_id
+        self.current_room = new_id
+        self.depart_after_switch = False
+        self.pending_interaction_kind = None
+        self.pending_interaction_target = None
+        self.awaiting_monster_result = False
+        self._clear_motion()
+
+    def _choose_action(self, player: Position, vision: PixelObservation) -> int:
+        """按当前可观测目标和已学习房间图选择动作。"""
+        memory = self._memory()
+        unopened = self._tiles_of_kind(vision, {"chest"}) - memory.opened_chests
+        if unopened:
+            return self._act_open_chest(player, vision, unopened)
+
+        if vision.monsters:
+            if self.has_sword:
+                return self._act_monster(player, vision)
+            return self._return_from_room(player, vision)
+
+        if memory.kind == "switch":
+            return self._act_switch_room(player, vision)
+        if memory.kind == "hub":
+            return self._act_hub_room(player, vision)
+        return self._return_from_room(player, vision)
+
+    def _act_switch_room(self, player: Position, vision: PixelObservation) -> int:
+        """机关房先探索未知出口；已连接桥房后才按需转桥。"""
+        memory = self._memory()
+        unknown = [direction for direction in self._reachable_directions(player, vision) if direction not in memory.connections]
+        if unknown:
+            return self._act_best_exit(player, vision, unknown)
+        if self.depart_after_switch:
+            directions = self._reachable_directions(player, vision)
+            if directions:
+                return self._act_best_exit(player, vision, directions)
+            return ACTION_NOOP
+        return self._act_switch(player, vision)
+
+    def _act_hub_room(self, player: Position, vision: PixelObservation) -> int:
+        """优先服务当前桥可达的未知或未完成分支，否则回机关房。"""
+        memory = self._memory()
+        reachable = self._reachable_directions(player, vision)
+        candidates: list[str] = []
+        switch_returns: list[str] = []
+        for direction in reachable:
+            if memory.exit_kinds.get(direction) == "exit_locked" and self.keys <= 0:
+                continue
+            neighbor_id = memory.connections.get(direction)
+            if neighbor_id is None:
+                candidates.append(direction)
+                continue
+            neighbor = self.rooms[neighbor_id]
+            if neighbor.kind == "switch":
+                switch_returns.append(direction)
+            elif self._room_serviceable(neighbor):
+                candidates.append(direction)
+        if candidates:
+            return self._act_best_exit(player, vision, candidates)
+        if switch_returns:
+            return self._act_best_exit(player, vision, switch_returns)
+        if memory.entry_direction in reachable:
+            return self._act_exit_directional(player, vision, memory.entry_direction)
+        return ACTION_NOOP
+
+    def _room_serviceable(self, memory: RoomMemory) -> bool:
+        """判断已知房间在当前物品条件下是否仍有可执行目标。"""
+        if memory.chests - memory.opened_chests:
+            return True
+        return memory.monster_seen and not memory.monster_cleared and self.has_sword
+
+    def _return_from_room(self, player: Position, vision: PixelObservation) -> int:
+        """叶子房完成或前置条件不足时，沿实际入口返回。"""
+        memory = self._memory()
+        if memory.entry_direction is not None:
+            return self._act_exit_directional(player, vision, memory.entry_direction)
+        directions = self._reachable_directions(player, vision)
+        if directions:
+            return self._act_best_exit(player, vision, directions)
+        return ACTION_NOOP
+
+    def _act_switch(self, player: Position, vision: PixelObservation) -> int:
+        """导航到视觉开关相邻格，面向后在下一帧按 A。"""
+        memory = self._memory()
+        raw = self._tiles_of_kind(vision, {"switch"})
+        if raw:
+            memory.switch_pos = min(raw)
+        if memory.switch_pos is None:
+            return ACTION_NOOP
+        target = memory.switch_pos
+        if manhattan(player, target) == 1:
+            face = action_toward(player, target)
+            if face is not None:
+                self.pending_interaction_kind = "switch"
+                self.pending_interaction_target = target
+                return face
+            return ACTION_NOOP
+        path = bfs_path(player, self._adjacent_positions({target}, vision), vision)
+        return self._start_path_step(path)
+
+    def _act_open_chest(self, player: Position, vision: PixelObservation, chests: set[Position]) -> int:
+        """靠近任一未交互宝箱，真正按 A 时才记录为已开。"""
+        adjacent = self._adjacent_positions(chests, vision)
+        if player in adjacent:
+            target = min(chests, key=lambda pos: manhattan(player, pos))
+            face = action_toward(player, target)
+            if face is not None:
+                self.pending_interaction_kind = "chest"
+                self.pending_interaction_target = target
+                return face
+            return ACTION_NOOP
+        return self._start_path_step(bfs_path(player, adjacent, vision))
+
+    def _act_monster(self, player: Position, vision: PixelObservation) -> int:
+        """仅在物品栏确认有剑时靠近并攻击当前可见怪物。"""
+        targets = {monster.tile for monster in vision.monsters}
+        target = min(targets, key=lambda pos: manhattan(player, pos))
+        if manhattan(player, target) == 1:
+            face = action_toward(player, target)
+            if face is not None:
+                self.pending_interaction_kind = "monster"
+                self.pending_interaction_target = target
+                return face
+            return ACTION_NOOP
+        return self._start_path_step(bfs_path(player, self._adjacent_positions(targets, vision), vision))
+
+    def _reachable_directions(self, player: Position, vision: PixelObservation) -> list[str]:
+        """返回当前画面中确实有像素路径可达的边界方向。"""
+        memory = self._memory()
+        out: list[tuple[int, str]] = []
+        for direction in sorted(memory.exits):
+            targets = self._exit_targets(vision, direction)
+            path = bfs_path(player, targets, vision)
+            if path:
+                out.append((len(path), direction))
+        return [direction for _, direction in sorted(out)]
+
+    def _act_best_exit(self, player: Position, vision: PixelObservation, directions: list[str]) -> int:
+        """按当前 BFS 实际距离选择出口，不使用固定方向优先级。"""
+        ranked: list[tuple[int, str]] = []
+        for direction in directions:
+            path = bfs_path(player, self._exit_targets(vision, direction), vision)
+            if path:
+                ranked.append((len(path), direction))
+        if not ranked:
+            return ACTION_NOOP
+        _, direction = min(ranked)
+        return self._act_exit_directional(player, vision, direction)
+
+    def _act_exit_directional(self, player: Position, vision: PixelObservation, direction: str) -> int:
+        """导航至指定边界的可达出口并持续向外推进。"""
+        targets = self._exit_targets(vision, direction)
         if self.exit_push_action is not None:
-            if self._can_continue_exit_push(player, reachable):
+            if (
+                self.pending_exit_direction == direction
+                and self.target_exit_tile == player
+                and is_boundary_tile(player)
+            ):
                 return self.exit_push_action
             self.exit_push_action = None
             self.target_exit_tile = None
-
-        if not reachable:
+            self.pending_exit_direction = None
+        if not targets:
             return ACTION_NOOP
-
-        if player in reachable or (
-            self.target_exit_tile is not None
-            and player == self.target_exit_tile
-            and is_boundary_tile(player)
-        ):
-            self.exit_push_action = boundary_exit_action(player)
+        # 玩家覆盖出口格后，CNN 会把该格改分为 player，因而它会从
+        # 当前帧的 exit targets 中消失。保留上一次 BFS 已验证的边界
+        # 目标，避免在同一出口的两个格之间来回振荡。
+        reached_remembered_target = (
+            self.target_exit_tile == player and direction in boundary_directions(player)
+        )
+        if player in targets or reached_remembered_target:
+            action = DIRECTION_ACTION[direction]
+            self.exit_push_action = action
             self.target_exit_tile = player
-            return self.exit_push_action or ACTION_NOOP
-
-        path = bfs_path(player, reachable, vision)
+            self.pending_exit_direction = direction
+            return action
+        path = bfs_path(player, targets, vision)
         if len(path) >= 2:
             self.target_exit_tile = path[-1]
             action = action_toward(path[0], path[1])
@@ -687,107 +459,102 @@ class Task4Agent:
                 return self._begin_tile_move(action, path[1])
         return ACTION_NOOP
 
-    def _filter_exits_by_boundary(
-        self, exit_tiles: set[Position], direction: str
-    ) -> set[Position]:
-        if direction == "west":
-            return {t for t in exit_tiles if t[0] == 0}
-        elif direction == "east":
-            return {t for t in exit_tiles if t[0] == GRID_WIDTH - 1}
-        elif direction == "north":
-            return {t for t in exit_tiles if t[1] == 0}
-        elif direction == "south":
-            return {t for t in exit_tiles if t[1] == GRID_HEIGHT - 1}
-        return exit_tiles
+    def _exit_targets(self, vision: PixelObservation, direction: str) -> set[Position]:
+        """使用边界出口分类，并在漏检时退化到可通行边界格。"""
+        visible = {
+            tile.tile
+            for tile in vision.tiles
+            if tile.kind in EXIT_KINDS and direction in boundary_directions(tile.tile)
+        }
+        reachable = {pos for pos in visible if is_walkable(pos, vision)}
+        if reachable:
+            return reachable
+        return {pos for pos in boundary_tiles(direction) if is_walkable(pos, vision)}
 
-    def _can_continue_exit_push(
-        self, player: Position, reachable_exit_tiles: set[Position]
-    ) -> bool:
-        return (
-            self.target_exit_tile is not None
-            and player == self.target_exit_tile
-            and is_boundary_tile(player)
-            and self.exit_push_action == boundary_exit_action(player)
-            and (player in reachable_exit_tiles or player == self.target_exit_tile)
-        )
-
-    # ================================================================
-    # Safety Shield
-    # ================================================================
-
-    def _shield_action(self, action: int, vision: PixelObservation) -> int:
-        if action not in MOVE_ACTIONS:
-            return action
-        if vision.player is None:
+    def _start_path_step(self, path: list[Position]) -> int:
+        """执行 BFS 路径的第一个 tile 移动。"""
+        if len(path) < 2:
             return ACTION_NOOP
-        player = vision.player.tile
+        action = action_toward(path[0], path[1])
+        if action is None:
+            return ACTION_NOOP
+        return self._begin_tile_move(action, path[1])
 
-        # 允许出口推出
-        if (
-            self.exit_push_action == action
-            and (
-                is_exit_tile(player, vision)
-                or (
-                    self.target_exit_tile is not None
-                    and player == self.target_exit_tile
-                    and is_boundary_tile(player)
-                )
-            )
-        ):
+    def _begin_tile_move(self, action: int, target: Position) -> int:
+        self.move_action = action
+        self.move_target_tile = target
+        self.move_attempts = 0
+        return action
+
+    def _continue_motion(self, player: Position, vision: PixelObservation) -> int | None:
+        """持续上一个短移动，到格、超时或需边界对齐时立即处理。"""
+        if self.move_target_tile is None or self.move_action is None:
+            return None
+        self.move_attempts += 1
+        if player == self.move_target_tile or self.move_attempts >= MAX_TILE_MOVE_ATTEMPTS:
+            self.move_target_tile = None
+            self.move_action = None
+            self.move_attempts = 0
+            return None
+        align = self._boundary_alignment_action(vision)
+        return self.move_action if align is None else align
+
+    def _boundary_alignment_action(self, vision: PixelObservation) -> int | None:
+        """到达边界出口格前对齐垂直像素轴，避免角落墙体碰撞。"""
+        if self.move_target_tile is None or self.move_action is None or vision.player is None:
+            return None
+        x, y = self.move_target_tile
+        center_x, center_y = vision.player.center_px
+        if x in {0, GRID_WIDTH - 1} and self.move_action in {ACTION_LEFT, ACTION_RIGHT}:
+            desired = y * TILE_SIZE + TILE_SIZE * 0.5
+            if center_y < desired - 0.5:
+                return ACTION_DOWN
+            if center_y > desired + 0.5:
+                return ACTION_UP
+        if y in {0, GRID_HEIGHT - 1} and self.move_action in {ACTION_UP, ACTION_DOWN}:
+            desired = x * TILE_SIZE + TILE_SIZE * 0.5
+            if center_x < desired - 0.5:
+                return ACTION_RIGHT
+            if center_x > desired + 0.5:
+                return ACTION_LEFT
+        return None
+
+    def _clear_motion(self) -> None:
+        self.move_target_tile = None
+        self.move_action = None
+        self.move_attempts = 0
+        self.exit_push_action = None
+        self.target_exit_tile = None
+        self.pending_exit_direction = None
+
+    def _safe_action(self, action: int, vision: PixelObservation) -> int:
+        """拦截越界或明确不可通行的移动，已确认出口推进除外。"""
+        if action not in MOVE_ACTIONS or vision.player is None:
             return action
-
+        player = vision.player.tile
+        if self.exit_push_action == action and self.target_exit_tile == player and is_boundary_tile(player):
+            return action
         nxt = next_position(player, action)
         if not in_bounds(nxt):
             return ACTION_NOOP
-
-        # 允许贴近交互目标（宝箱、开关、怪物）
-        nxt_kind = vision.grid[nxt[1]][nxt[0]]
-        if nxt_kind in ("chest", "switch", "button_pressed", "monster"):
+        if vision.grid[nxt[1]][nxt[0]] in {"chest", "switch", "button_pressed", "monster"}:
             return action
-
-        if not is_walkable(nxt, vision):
-            return ACTION_NOOP
-        return action
-
-    # ================================================================
-    # 通用辅助
-    # ================================================================
+        return action if is_walkable(nxt, vision) else ACTION_NOOP
 
     def _tiles_of_kind(self, vision: PixelObservation, kinds: set[str]) -> set[Position]:
         return {tile.tile for tile in vision.tiles if tile.kind in kinds}
 
-    def _visible_switch_positions(self, vision: PixelObservation) -> set[Position]:
-        """返回有时序依据支持的开关位置。
+    def _adjacent_positions(self, positions: set[Position], vision: PixelObservation) -> set[Position]:
+        return {
+            neighbor
+            for position in positions
+            for neighbor in neighbors(position)
+            if in_bounds(neighbor) and is_walkable(neighbor, vision)
+        }
 
-        CNN 在反色画面中偶尔会把已打开的宝箱识别为
-        ``button_pressed``。因此 ``switch`` 可以建立新的位置记忆，
-        ``button_pressed`` 则只能确认已经由 switch 帧学到的同一位置。
-        这样既支持开关按下后的贴图变化，也不会让单帧误报
-        改写房间识别。
-        """
-        positions = self._tiles_of_kind(vision, {"switch"})
-        if self.switch_pos is not None:
-            pressed = self._tiles_of_kind(vision, {"button_pressed"})
-            if self.switch_pos in pressed:
-                positions.add(self.switch_pos)
-        return positions
-
-    def _adjacent_positions(
-        self, positions: set[Position], vision: PixelObservation
-    ) -> set[Position]:
-        out: set[Position] = set()
-        for pos in positions:
-            for nb in neighbors(pos):
-                if in_bounds(nb) and is_walkable(nb, vision):
-                    out.add(nb)
-        return out
-
-
-# ============================================================================
-# BFS & 路径工具函数
-# ============================================================================
 
 def bfs_path(start: Position, goals: set[Position], vision: PixelObservation) -> list[Position]:
+    """在当前视觉网格上执行标准 BFS。"""
     if start in goals:
         return [start]
     queue: deque[Position] = deque([start])
@@ -795,11 +562,9 @@ def bfs_path(start: Position, goals: set[Position], vision: PixelObservation) ->
     while queue:
         current = queue.popleft()
         for nxt in neighbors(current):
-            if nxt in parent:
+            if nxt in parent or not in_bounds(nxt):
                 continue
             if nxt not in goals and not is_walkable(nxt, vision):
-                continue
-            if not in_bounds(nxt):
                 continue
             parent[nxt] = current
             if nxt in goals:
@@ -807,96 +572,75 @@ def bfs_path(start: Position, goals: set[Position], vision: PixelObservation) ->
             queue.append(nxt)
     return []
 
+
 def reconstruct_path(parent: dict[Position, Position | None], goal: Position) -> list[Position]:
     path: list[Position] = []
     current: Position | None = goal
     while current is not None:
         path.append(current)
         current = parent[current]
-    path.reverse()
-    return path
+    return list(reversed(path))
+
 
 def is_walkable(pos: Position, vision: PixelObservation) -> bool:
     if not in_bounds(pos):
         return False
     kind = vision.grid[pos[1]][pos[0]]
-    if kind in BLOCKING_KINDS:
-        return False
-    return kind in SAFE_WALKABLE_KINDS
+    return kind not in BLOCKING_KINDS and kind in SAFE_WALKABLE_KINDS
+
 
 def neighbors(pos: Position) -> tuple[Position, Position, Position, Position]:
-    col, row = pos
-    return ((col, row - 1), (col, row + 1), (col - 1, row), (col + 1, row))
+    x, y = pos
+    return ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y))
+
 
 def in_bounds(pos: Position) -> bool:
-    col, row = pos
-    return 0 <= col < GRID_WIDTH and 0 <= row < GRID_HEIGHT
+    return 0 <= pos[0] < GRID_WIDTH and 0 <= pos[1] < GRID_HEIGHT
 
-def _boundary_tiles(direction: str) -> set[Position]:
-    """返回指定方向的所有边界 tile 坐标（作为视觉漏检出口时的 fallback）。"""
+
+def boundary_tiles(direction: str) -> set[Position]:
     if direction == "west":
-        return {(0, r) for r in range(GRID_HEIGHT)}
-    elif direction == "east":
-        return {(GRID_WIDTH - 1, r) for r in range(GRID_HEIGHT)}
-    elif direction == "north":
-        return {(c, 0) for c in range(GRID_WIDTH)}
-    elif direction == "south":
-        return {(c, GRID_HEIGHT - 1) for c in range(GRID_WIDTH)}
-    return set()
+        return {(0, row) for row in range(GRID_HEIGHT)}
+    if direction == "east":
+        return {(GRID_WIDTH - 1, row) for row in range(GRID_HEIGHT)}
+    if direction == "north":
+        return {(column, 0) for column in range(GRID_WIDTH)}
+    return {(column, GRID_HEIGHT - 1) for column in range(GRID_WIDTH)}
+
+
+def boundary_directions(pos: Position) -> tuple[str, ...]:
+    directions: list[str] = []
+    if pos[1] == 0:
+        directions.append("north")
+    if pos[1] == GRID_HEIGHT - 1:
+        directions.append("south")
+    if pos[0] == 0:
+        directions.append("west")
+    if pos[0] == GRID_WIDTH - 1:
+        directions.append("east")
+    return tuple(directions)
 
 
 def is_boundary_tile(pos: Position) -> bool:
-    col, row = pos
-    return col == 0 or row == 0 or col == GRID_WIDTH - 1 or row == GRID_HEIGHT - 1
+    return bool(boundary_directions(pos))
 
-def is_exit_tile(pos: Position, vision: PixelObservation) -> bool:
-    if not in_bounds(pos):
-        return False
-    return is_boundary_tile(pos) and vision.grid[pos[1]][pos[0]] in {
-        "exit_locked", "exit_normal", "exit_conditional",
-    }
-
-def boundary_exit_action(pos: Position) -> int | None:
-    col, row = pos
-    if row == 0:
-        return ACTION_UP
-    if row == GRID_HEIGHT - 1:
-        return ACTION_DOWN
-    if col == 0:
-        return ACTION_LEFT
-    if col == GRID_WIDTH - 1:
-        return ACTION_RIGHT
-    return None
-
-def inventory_key_count(info) -> int | None:
-    if not isinstance(info, dict):
-        return None
-    inventory = info.get("inventory")
-    if not isinstance(inventory, dict):
-        return None
-    try:
-        return int(inventory.get("keys", 0) or 0)
-    except (TypeError, ValueError):
-        return None
 
 def next_position(pos: Position, action: int) -> Position:
     dx, dy = ACTION_TO_DELTA[action]
     return (pos[0] + dx, pos[1] + dy)
 
+
 def action_toward(current: Position, nxt: Position) -> int | None:
-    delta = (nxt[0] - current[0], nxt[1] - current[1])
-    return DELTA_TO_ACTION.get(delta)
+    return DELTA_TO_ACTION.get((nxt[0] - current[0], nxt[1] - current[1]))
+
 
 def manhattan(left: Position, right: Position) -> int:
     return abs(left[0] - right[0]) + abs(left[1] - right[1])
 
 
-# ============================================================================
-# 评测接口
-# ============================================================================
-
 Policy = Task4Agent
 
 
 def make_policy() -> Task4Agent:
+    """为每个 episode 创建全新的观测驱动 Task4 策略。"""
     return Task4Agent()
