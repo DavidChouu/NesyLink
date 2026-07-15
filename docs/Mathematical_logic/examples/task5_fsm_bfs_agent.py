@@ -48,6 +48,10 @@ from nesylink.vision import PixelObservation, classify_frame_cnn  # noqa: E402
 Position = tuple[int, int]
 RoomCoord = tuple[int, int]
 
+# 项目规则文档公开说明玩家初始生命为 5；策略只把它作为奖励反馈的
+# 起始预算，不读取运行时真实 HP，也不推断任何固定扣血时间。
+DOCUMENTED_INITIAL_HEALTH = 5
+
 MOVE_ACTIONS = (ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT)
 ACTION_DELTA = {
     ACTION_UP: (0, -1),
@@ -178,8 +182,8 @@ class Task5FSMBFSAgent:
     shield_cooldown: int = 0
     shield_move_armed: bool = False
     shield_ticks_remaining: int = 0
-    contact_damage: int = 0
-    last_support_step: int = 0
+    observed_damage: int = 0
+    support_observed: bool = False
     service_combat_attempted: set[RoomCoord] = field(default_factory=set)
     chest_progress: dict[tuple[RoomCoord, Position], tuple[int, int]] = field(default_factory=dict)
     exit_progress: dict[tuple[RoomCoord, str], tuple[float, int]] = field(default_factory=dict)
@@ -232,8 +236,8 @@ class Task5FSMBFSAgent:
         self.shield_cooldown = 0
         self.shield_move_armed = False
         self.shield_ticks_remaining = 0
-        self.contact_damage = 0
-        self.last_support_step = 0
+        self.observed_damage = 0
+        self.support_observed = False
         self.service_combat_attempted.clear()
         self.chest_progress.clear()
         self.exit_progress.clear()
@@ -411,18 +415,32 @@ class Task5FSMBFSAgent:
                     self.settle_chests.discard((self.room, chest))
                     self.nudged_chests.discard((self.room, chest))
                 self.queue.clear()
-        if reward <= -1.0:
+        negative_damage_signal = reward <= -1.0
+        if negative_damage_signal:
+            # safe_info 不公开 HP，正式像素帧也不包含状态栏。每次明确的
+            # 大额负奖励只记为一次已观察损伤；不根据发生步数猜测其来源。
+            self.observed_damage = min(
+                DOCUMENTED_INITIAL_HEALTH, self.observed_damage + 1
+            )
             memory.risk += 1
-            previous_env_step = self.step_count - 1
-            periodic_drain = previous_env_step > 0 and previous_env_step % 200 == 0
-            if not periodic_drain and self.previous_vision is not None and self.last_player is not None:
+            if self.previous_vision is not None and self.last_player is not None:
                 nearby_monsters = {
                     monster.tile
                     for monster in self.previous_vision.monsters
                     if manhattan(self.last_player, monster.tile) <= 2
                 }
-                if nearby_monsters:
-                    self.contact_damage += 1
+                moved_into_danger = False
+                if self.last_action in MOVE_ACTIONS:
+                    attempted = next_position(self.last_player, self.last_action)
+                    moved_into_danger = any(
+                        manhattan(attempted, monster) <= 1 for monster in nearby_monsters
+                    )
+                touching_monster = any(
+                    manhattan(self.last_player, monster) <= 1 for monster in nearby_monsters
+                )
+                # 未知环境损伤不能仅因画面远处恰有怪物就归因给怪物。
+                # 只有上一动作确实进入接触区，才增强对应怪物的威胁证据。
+                if nearby_monsters and (moved_into_danger or touching_monster):
                     for monster in nearby_monsters:
                         memory.threat_evidence[monster] = min(
                             6, memory.threat_evidence.get(monster, 0) + 2
@@ -704,8 +722,10 @@ class Task5FSMBFSAgent:
                 memory.opened_chests.add(chest)
                 if self.last_key_delta == 0 and self.last_gold_delta == 0:
                     memory.support_chests.add(chest)
-                    self.last_support_step = self.step_count
-                    self.contact_damage = 0
+                    self.support_observed = True
+                    # 该宝箱由奖励、背包无变化和视觉消失共同确认为支持型；
+                    # 治疗后从新的公开反馈窗口重新累计损伤。
+                    self.observed_damage = 0
                 self.goal = None
                 self.queue.clear()
             elif room == self.room:
@@ -1700,18 +1720,21 @@ class Task5FSMBFSAgent:
         return action
 
     def _rush_mode(self) -> bool:
-        """根据公开的周期扣血规则和已观测风险估计保守生存预算，决定是否赶路。"""
+        """根据公开初始生命和已收到的损伤反馈决定是否赶路。"""
         return self._survival_budget() <= 2
 
     def _survival_budget(self) -> int:
-        """由公开周期扣血、最近支持宝箱和已观察接触伤害估计保守窗口。"""
-        drain_period = 200
-        drains = self.step_count // drain_period - self.last_support_step // drain_period
-        return 5 - max(0, drains) - self.contact_damage
+        """由文档公开的初始生命与已观察损伤给出保守余量。
+
+        正式 safe_info 不公开真实 HP，像素帧也没有状态栏。本函数只按
+        ``last_reward`` 中已经发生的大额负反馈逐次扣减，不使用步数、
+        固定周期或损伤来源等环境内部知识。
+        """
+        return max(0, DOCUMENTED_INITIAL_HEALTH - self.observed_damage)
 
     def _chest_cautious(self) -> bool:
         """根据感知不确定性、生存预算和钥匙进度决定接近宝箱时是否严格避怪。"""
-        if self.last_support_step > 0 and "shield" in self.tools:
+        if self.support_observed and "shield" in self.tools:
             return False
         if self.perception_uncertainty >= 0.45 and self._survival_budget() > 2:
             return True
