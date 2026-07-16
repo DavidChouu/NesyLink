@@ -8425,7 +8425,6 @@ theorem publicS27_running : Running publicS27 := by
 @[simp] theorem publicS27_current : publicS27.currentRoom = 1 := by
   simp [publicS27, publicS26_current]
 
-set_option maxHeartbeats 800000 in
 theorem publicS27_south : publicS27.rooms 4 = publicSouthRoom := by
   simp [publicS27, publicS26, publicS25, publicS24, activateSwitchState,
     publicS23, publicS22, publicS21, publicS20, publicS19, publicS18,
@@ -8579,26 +8578,58 @@ theorem publicS31_running : Running publicS31 := by
   rw [resolveMonsterKill_currentRoom]
   exact publicS30_current
 
-set_option maxHeartbeats 800000 in
 @[simp] theorem publicS31_room :
     currentRoomState publicS31 = publicSouthRoom [] := by
-  simp [publicS31, resolveMonsterKill, publicS30_room, publicS30_current,
-    publicSouthRoom, publicGuardian, removeMonster,
+  have hremoved :
+      removeMonster (currentRoomState publicS30) publicGuardian =
+        publicSouthRoom [] := by
+    rw [publicS30_room]
+    simp [publicSouthRoom, publicGuardian, removeMonster]
+  change currentRoomState (resolveMonsterKill publicS30 publicGuardian) =
+    publicSouthRoom []
+  unfold resolveMonsterKill
+  rw [hremoved]
+  simp [publicS30_current, publicSouthRoom,
     unlockAllMonstersDefeatedExits, revealEligibleChestsInWorld,
     revealEligibleChests, updateCurrentRoom, setRoom,
-    requirementContainsAllMonstersDefeated, currentRoomState]
+    requirementContainsAllMonstersDefeated, currentRoomState,
+    publicSouthNorth]
 
 theorem public_guardian_reveals_final_chest :
     publicS31.rooms 1 =
       publicCenterUnlocked .westToSouth revealedFinalChest := by
-  simp [publicS31, resolveMonsterKill, publicS30_room, publicS30_current,
-    publicS30_center, publicSouthRoom, publicGuardian, removeMonster,
-    unlockAllMonstersDefeatedExits, revealEligibleChestsInWorld,
-    revealEligibleChests, updateCurrentRoom, setRoom,
-    requirementContainsAllMonstersDefeated, publicCenterUnlocked,
-    publicCenterRoom, revealedFinalChest, publicFinalChest,
-    chestRevealMatches, publicCenterEast, publicCenterWest,
-    publicCenterNorth, publicCenterSouth, replaceExit]
+  have hremoved :
+      removeMonster (currentRoomState publicS30) publicGuardian =
+        publicSouthRoom [] := by
+    rw [publicS30_room]
+    simp [publicSouthRoom, publicGuardian, removeMonster]
+  have hreveal :
+      revealEligibleChests (publicCenterUnlocked .westToSouth) 4 =
+        publicCenterUnlocked .westToSouth revealedFinalChest := by
+    simp [revealEligibleChests, publicCenterUnlocked, publicCenterRoom,
+      revealedFinalChest, publicFinalChest, chestRevealMatches,
+      unlockExitInRoom, publicCenterEast, replaceExit]
+  have hroomBeforeReveal :
+      (setRoom
+        (updateCurrentRoom
+          { currentRoom := 4
+            rooms := publicS30.rooms
+            roomIds := publicS30.roomIds
+            player := rewardPlayer publicS30.player monsterKillGold
+            completed := publicS30.completed }
+          (publicSouthRoom [])).rooms
+        4
+        (unlockAllMonstersDefeatedExits (publicSouthRoom []))) 1 =
+        publicCenterUnlocked .westToSouth := by
+    simp [updateCurrentRoom, setRoom, publicS30_current, publicS30_center]
+  have hempty : (publicSouthRoom []).monsters = [] := rfl
+  change (resolveMonsterKill publicS30 publicGuardian).rooms 1 = _
+  unfold resolveMonsterKill
+  rw [hremoved]
+  simp only [hempty, ↓reduceIte, revealEligibleChestsInWorld]
+  rw [publicS30_current]
+  rw [hroomBeforeReveal]
+  exact hreveal
 
 theorem public_route_guardian_to_south_exit :
     EngineExec publicS31
@@ -8690,6 +8721,9 @@ theorem publicS34_running : Running publicS34 := by
       publicCenterUnlocked .westToSouth revealedFinalChest := by
   simpa [publicS34] using publicS33_room
 
+@[simp] theorem publicS34_current : publicS34.currentRoom = 1 := by
+  simp [publicS34, publicS33_current]
+
 @[simp] theorem publicS34_pos : publicS34.player.pos = publicPos 4 5 := by
   simp [publicS34, publicS33, publicSouthNorth, centerSouthToFinalDirections,
     publicPos, directionEndpoint, advance]
@@ -8713,35 +8747,260 @@ theorem public_open_final_chest :
     publicCenterRoom, unlockExitInRoom, publicCenterEast, replaceExit,
     replaceChest, revealedFinalChest, openedFinalChest]
 
+@[simp] theorem publicS35_current : publicS35.currentRoom = 1 := by
+  simp [publicS35, publicS34, publicS33_current]
+
+@[simp] theorem publicS35_center :
+    publicS35.rooms 1 =
+      publicCenterUnlocked .westToSouth openedFinalChest := by
+  simpa [currentRoomState, publicS35_current] using publicS35_room
+
+private theorem openChestResult_other_room
+    (s : WorldState) (chest : Chest) (roomId : RoomId)
+    (hother : roomId ≠ s.currentRoom) :
+    (openChestResult s chest).rooms roomId = s.rooms roomId := by
+  simp [openChestResult, updateCurrentRoom, setRoom, hother]
+
+private theorem transitionThroughExit_other_room
+    (s : WorldState) (exit : Exit) (roomId : RoomId)
+    (hother : roomId ≠ s.currentRoom) :
+    (transitionThroughExit s exit).rooms roomId = s.rooms roomId := by
+  simp [transitionThroughExit, setRoom, hother]
+
+private theorem transitionThroughNormalExit_preserves_room
+    (s : WorldState) (exit : Exit) (roomId : RoomId)
+    (hnormal : exit.kind = .normal) :
+    (transitionThroughExit s exit).rooms roomId = s.rooms roomId := by
+  by_cases hcurrent : roomId = s.currentRoom
+  · subst roomId
+    simp [transitionThroughExit, unlockExitInRoom, hnormal,
+      currentRoomState, setRoom]
+  · simp [transitionThroughExit, unlockExitInRoom, hnormal,
+      currentRoomState, setRoom, hcurrent]
+
+private theorem activateSwitchState_other_room
+    (s : WorldState) (switch : Switch) (roomId : RoomId)
+    (hcurrent : roomId ≠ s.currentRoom)
+    (htarget : roomId ≠ switch.targetRoom) :
+    (activateSwitchState s switch).rooms roomId = s.rooms roomId := by
+  simp [activateSwitchState, setRoom, hcurrent, htarget]
+
+@[simp] theorem publicS35_south :
+    publicS35.rooms 4 = publicSouthRoom [] := by
+  have h32 : publicS32.rooms 4 = publicSouthRoom [] := by
+    simpa [currentRoomState, publicS32_current] using publicS32_room
+  have h33 : publicS33.rooms 4 = publicSouthRoom [] := by
+    simp [publicS33, transitionThroughExit, publicSouthNorth,
+      unlockExitInRoom, setRoom, publicS32_current, h32]
+  calc
+    publicS35.rooms 4 = publicS34.rooms 4 :=
+      openChestResult_other_room publicS34 revealedFinalChest 4 (by simp)
+    _ = publicS33.rooms 4 := by simp [publicS34]
+    _ = publicSouthRoom [] := h33
+
+@[simp] theorem publicS35_west :
+    publicS35.rooms 0 = publicWestRoom true := by
+  have h24 : publicS24.rooms 0 = publicWestRoom true := by
+    simpa [currentRoomState, publicS24_current] using publicS24_room
+  have h26 : publicS26.rooms 0 = publicWestRoom true := by
+    have h25 : publicS25.rooms 0 = publicWestRoom true := by
+      simpa [publicS25] using h24
+    simp [publicS26, transitionThroughExit, publicWestEast,
+      unlockExitInRoom, setRoom, publicS25_current, h25]
+  have h30 : publicS30.rooms 0 = publicWestRoom true := by
+    calc
+      publicS30.rooms 0 = publicS29.rooms 0 := by simp [publicS30]
+      _ = publicS28.rooms 0 := by simp [publicS29]
+      _ = publicS27.rooms 0 :=
+        transitionThroughExit_other_room publicS27 publicCenterSouth 0
+          (by simp [publicS27_current])
+      _ = publicS26.rooms 0 := by simp [publicS27]
+      _ = publicWestRoom true := h26
+  have h31 : publicS31.rooms 0 = publicWestRoom true := by
+    rw [publicS31]
+    exact (resolveMonsterKill_other_room publicS30 publicGuardian 0
+      (by simp [publicS30_current])
+      (by simp [h30, publicWestRoom, revealEligibleChests])).trans h30
+  calc
+    publicS35.rooms 0 = publicS34.rooms 0 :=
+      openChestResult_other_room publicS34 revealedFinalChest 0 (by simp)
+    _ = publicS33.rooms 0 := by simp [publicS34]
+    _ = publicS32.rooms 0 :=
+      transitionThroughExit_other_room publicS32 publicSouthNorth 0
+        (by simp [publicS32_current])
+    _ = publicS31.rooms 0 := by simp [publicS32]
+    _ = publicWestRoom true := h31
+
+@[simp] theorem publicS35_north :
+    publicS35.rooms 2 = publicNorthRoom (openedChest publicKeyChest) := by
+  have h06current : publicS06.currentRoom = 2 := by
+    simp [publicS06, publicS05, publicS04, publicS03, publicS02,
+      publicS01, publicCenterNorth]
+  have h06 : publicS06.rooms 2 =
+      publicNorthRoom (openedChest publicKeyChest) := by
+    simpa [currentRoomState, h06current] using publicS06_room
+  have h08 : publicS08.rooms 2 =
+      publicNorthRoom (openedChest publicKeyChest) := by
+    have h07 : publicS07.rooms 2 =
+        publicNorthRoom (openedChest publicKeyChest) := by
+      simpa [publicS07] using h06
+    simp [publicS08, transitionThroughExit, publicNorthSouth,
+      unlockExitInRoom, setRoom, h06current, h07]
+  have h30 : publicS30.rooms 2 =
+      publicNorthRoom (openedChest publicKeyChest) := by
+    calc
+      publicS30.rooms 2 = publicS29.rooms 2 := by simp [publicS30]
+      _ = publicS28.rooms 2 := by simp [publicS29]
+      _ = publicS27.rooms 2 :=
+        transitionThroughNormalExit_preserves_room
+          publicS27 publicCenterSouth 2 rfl
+      _ = publicS26.rooms 2 := by simp [publicS27]
+      _ = publicS25.rooms 2 :=
+        transitionThroughNormalExit_preserves_room
+          publicS25 publicWestEast 2 rfl
+      _ = publicS24.rooms 2 := by simp [publicS25]
+      _ = publicS23.rooms 2 :=
+        activateSwitchState_other_room publicS23 publicPressedSwitch 2
+          (by simp [publicS23_current])
+          (by simp [publicPressedSwitch, publicSwitch])
+      _ = publicS22.rooms 2 := by simp [publicS23]
+      _ = publicS21.rooms 2 :=
+        transitionThroughNormalExit_preserves_room
+          publicS21 publicCenterWest 2 rfl
+      _ = publicS20.rooms 2 := by simp [publicS21]
+      _ = publicS19.rooms 2 :=
+        transitionThroughNormalExit_preserves_room
+          publicS19 publicEastWest 2 rfl
+      _ = publicS18.rooms 2 := by simp [publicS19]
+      _ = publicS17.rooms 2 :=
+        openChestResult_other_room publicS17 publicSwordChest 2
+          (by simp [publicS17, publicS16, publicCenterEast])
+      _ = publicS16.rooms 2 := by simp [publicS17]
+      _ = publicS15.rooms 2 :=
+        transitionThroughExit_other_room publicS15 publicCenterEast 2
+          (by simp [publicS15, publicS14_current])
+      _ = publicS14.rooms 2 := by simp [publicS15]
+      _ = publicS13.rooms 2 :=
+        transitionThroughNormalExit_preserves_room
+          publicS13 publicWestEast 2 rfl
+      _ = publicS12.rooms 2 := by simp [publicS13]
+      _ = publicS11.rooms 2 :=
+        activateSwitchState_other_room publicS11 publicSwitch 2
+          (by simp [publicS11_current]) (by simp [publicSwitch])
+      _ = publicS10.rooms 2 := by simp [publicS11]
+      _ = publicS09.rooms 2 :=
+        transitionThroughNormalExit_preserves_room
+          publicS09 publicCenterWest 2 rfl
+      _ = publicS08.rooms 2 := by simp [publicS09]
+      _ = publicNorthRoom (openedChest publicKeyChest) := h08
+  have h31 : publicS31.rooms 2 =
+      publicNorthRoom (openedChest publicKeyChest) := by
+    rw [publicS31]
+    exact (resolveMonsterKill_other_room publicS30 publicGuardian 2
+      (by simp [publicS30_current])
+      (by simp [h30, publicNorthRoom, openedChest, publicKeyChest,
+        revealEligibleChests])).trans h30
+  calc
+    publicS35.rooms 2 = publicS34.rooms 2 :=
+      openChestResult_other_room publicS34 revealedFinalChest 2 (by simp)
+    _ = publicS33.rooms 2 := by simp [publicS34]
+    _ = publicS32.rooms 2 :=
+      transitionThroughExit_other_room publicS32 publicSouthNorth 2
+        (by simp [publicS32_current])
+    _ = publicS31.rooms 2 := by simp [publicS32]
+    _ = publicNorthRoom (openedChest publicKeyChest) := h31
+
+@[simp] theorem publicS35_east :
+    publicS35.rooms 3 = publicEastRoom (openedChest publicSwordChest) := by
+  have h18current : publicS18.currentRoom = 3 := by
+    simp [publicS18, publicS17, publicS16, publicCenterEast]
+  have h18 : publicS18.rooms 3 =
+      publicEastRoom (openedChest publicSwordChest) := by
+    simpa [currentRoomState, h18current] using publicS18_room
+  have h20 : publicS20.rooms 3 =
+      publicEastRoom (openedChest publicSwordChest) := by
+    have h19 : publicS19.rooms 3 =
+        publicEastRoom (openedChest publicSwordChest) := by
+      simpa [publicS19] using h18
+    simp [publicS20, transitionThroughExit, publicEastWest,
+      unlockExitInRoom, setRoom, publicS19_current, h19]
+  have h30 : publicS30.rooms 3 =
+      publicEastRoom (openedChest publicSwordChest) := by
+    calc
+      publicS30.rooms 3 = publicS29.rooms 3 := by simp [publicS30]
+      _ = publicS28.rooms 3 := by simp [publicS29]
+      _ = publicS27.rooms 3 :=
+        transitionThroughNormalExit_preserves_room
+          publicS27 publicCenterSouth 3 rfl
+      _ = publicS26.rooms 3 := by simp [publicS27]
+      _ = publicS25.rooms 3 :=
+        transitionThroughNormalExit_preserves_room
+          publicS25 publicWestEast 3 rfl
+      _ = publicS24.rooms 3 := by simp [publicS25]
+      _ = publicS23.rooms 3 :=
+        activateSwitchState_other_room publicS23 publicPressedSwitch 3
+          (by simp [publicS23_current])
+          (by simp [publicPressedSwitch, publicSwitch])
+      _ = publicS22.rooms 3 := by simp [publicS23]
+      _ = publicS21.rooms 3 :=
+        transitionThroughNormalExit_preserves_room
+          publicS21 publicCenterWest 3 rfl
+      _ = publicS20.rooms 3 := by simp [publicS21]
+      _ = publicEastRoom (openedChest publicSwordChest) := h20
+  have h31 : publicS31.rooms 3 =
+      publicEastRoom (openedChest publicSwordChest) := by
+    rw [publicS31]
+    exact (resolveMonsterKill_other_room publicS30 publicGuardian 3
+      (by simp [publicS30_current])
+      (by simp [h30, publicEastRoom, openedChest, publicSwordChest,
+        revealEligibleChests])).trans h30
+  calc
+    publicS35.rooms 3 = publicS34.rooms 3 :=
+      openChestResult_other_room publicS34 revealedFinalChest 3 (by simp)
+    _ = publicS33.rooms 3 := by simp [publicS34]
+    _ = publicS32.rooms 3 :=
+      transitionThroughExit_other_room publicS32 publicSouthNorth 3
+        (by simp [publicS32_current])
+    _ = publicS31.rooms 3 := by simp [publicS32]
+    _ = publicEastRoom (openedChest publicSwordChest) := h31
+
+@[simp] theorem publicS35_roomIds : publicS35.roomIds = [0, 1, 2, 3, 4] := by
+  simp [publicS35, publicS34, publicS33, publicS32, publicS31,
+    publicS30, faceWorld, publicS29, publicS28, publicS27, publicS26,
+    publicS25, publicS24, publicS23, publicS22, publicS21, publicS20,
+    publicS19, publicS18, publicS17, publicS16, publicS15, publicS14,
+    publicS13, publicS12, publicS11, publicS10, publicS09, publicS08,
+    publicS07, publicS06, publicS05, publicS04, publicS03, publicS02,
+    publicS01, publicInitialWorld]
+
 theorem publicS35_running : Running publicS35 := by
   rcases publicS34_running with ⟨halive, hcomplete⟩
   exact ⟨by simpa [alive, publicS35, openChestResult,
       revealedFinalChest, publicFinalChest, collectLoot] using halive,
     by simpa [publicS35, openChestResult] using hcomplete⟩
 
-set_option maxHeartbeats 2000000 in
 theorem publicS35_all_world_chests_opened : allWorldChestsOpened publicS35 := by
-  simp [allWorldChestsOpened, allVisibleChestsOpened, publicS35,
-    openChestResult, publicS34, publicS33, publicS32, publicS31,
-    resolveMonsterKill, publicS30, publicS29, publicS28, publicS27,
-    publicS26, publicS25, publicS24, publicS23, publicS22, publicS21,
-    publicS20, publicS19, publicS18, publicS17, publicS16, publicS15,
-    publicS14, publicS13, publicS12, publicS11, publicS10, publicS09,
-    publicS08, publicS07, publicS06, publicS05, publicS04, publicS03,
-    publicS02, publicS01, publicInitialWorld, publicRooms,
-    transitionThroughExit, activateSwitchState, updateCurrentRoom, setRoom,
-    unlockExitInRoom, replaceExit, replaceChest, replaceSwitch,
-    removeMonster, unlockAllMonstersDefeatedExits,
-    revealEligibleChestsInWorld, revealEligibleChests,
-    publicWestEast, publicCenterWest, publicCenterEast, publicCenterNorth,
-    publicCenterSouth, publicNorthSouth, publicEastWest, publicSouthNorth,
-    publicWestRoom, publicNorthRoom, publicEastRoom, publicSouthRoom,
-    publicCenterRoom, publicCenterUnlocked, publicSwitch,
-    publicPressedSwitch, publicKeyChest, publicSwordChest, publicGuardian,
-    publicFinalChest, revealedFinalChest, openedFinalChest, openedChest,
-    collectLoot, rewardPlayer, rotateBridge, publicBridge,
-    chestRevealMatches, requirementContainsAllMonstersDefeated,
-    currentRoomState]
+  refine ⟨?_, ?_, ?_⟩
+  · simp
+  · refine ⟨1, ?_, openedFinalChest, ?_⟩
+    · simp
+    · simp [publicS35_center, publicCenterUnlocked, publicCenterRoom,
+        unlockExitInRoom, publicCenterEast, replaceExit, openedFinalChest,
+        revealedFinalChest, publicFinalChest]
+  · intro roomId hroom
+    rw [publicS35_roomIds] at hroom
+    simp at hroom
+    rcases hroom with rfl | rfl | rfl | rfl | rfl
+    · simp [allVisibleChestsOpened, publicS35_west, publicWestRoom]
+    · simp [allVisibleChestsOpened, publicS35_center,
+        publicCenterUnlocked, publicCenterRoom, unlockExitInRoom,
+        publicCenterEast, replaceExit, openedFinalChest, revealedFinalChest,
+        publicFinalChest]
+    · simp [allVisibleChestsOpened, publicS35_north, publicNorthRoom,
+        openedChest, publicKeyChest]
+    · simp [allVisibleChestsOpened, publicS35_east, publicEastRoom,
+        openedChest, publicSwordChest]
+    · simp [allVisibleChestsOpened, publicS35_south, publicSouthRoom]
 
 theorem public_completion_tick : EngineExec publicS35 [.wait] publicS37 := by
   have hplayer : PlayerStep publicS35 .wait publicS36 [.waited] := by
@@ -9438,8 +9697,12 @@ def publicRooms : RoomId → RoomState
   | _ => publicCenterRoom
 def publicInitialPlayer : PlayerState :=
   { pos := publicPos 1 1, facing := .east, hp := 5, maxHp := 5,
-    inventory := { keys := 0, gold := 0, items := [.sword, .shield],
-      equippedA := some .sword, equippedB := some .shield } }
+    inventory :=
+      { keys := 0
+        gold := 0
+        items := [.sword, .shield]
+        equippedA := some .sword
+        equippedB := some .shield } }
 def publicInitialWorld : WorldState :=
   { currentRoom := 0, rooms := publicRooms, roomIds := [0, 1, 2, 3],
     player := publicInitialPlayer, completed := false }
@@ -9609,6 +9872,9 @@ theorem publicT01_running : Running publicT01 := by
     currentRoomState publicT01 = publicCenterRoom := by
   simp [publicT01, publicInitialWorld, currentRoomState, publicRooms]
 
+@[simp] theorem publicT01_current : publicT01.currentRoom = 0 := by
+  simp [publicT01, publicInitialWorld]
+
 @[simp] theorem publicT01_pos : publicT01.player.pos = publicPos 3 2 := by
   simp [publicT01, publicInitialWorld, publicInitialPlayer, toCenterChest,
     publicPos, directionEndpoint, advance]
@@ -9636,6 +9902,9 @@ theorem publicT02_running : Running publicT02 := by
   simp [publicT02, openChestResult, publicT01_room, publicCenterRoom,
     replaceChest, openedChest]
 
+@[simp] theorem publicT02_current : publicT02.currentRoom = 0 := by
+  simp [publicT02, publicT01_current]
+
 @[simp] theorem publicT02_pos : publicT02.player.pos = publicPos 3 2 := by
   simpa [publicT02] using publicT01_pos
 
@@ -9659,6 +9928,9 @@ theorem publicT03_running : Running publicT03 := by
       publicCenterRoom (openedChest publicCenterChest) := by
   simpa [publicT03] using publicT02_room
 
+@[simp] theorem publicT03_current : publicT03.currentRoom = 0 := by
+  simp [publicT03, publicT02_current]
+
 @[simp] theorem publicT03_pos : publicT03.player.pos = publicPos 2 5 := by
   simp [publicT03, publicT02_pos, centerChestToButton, publicPos,
     directionEndpoint, advance]
@@ -9671,7 +9943,7 @@ theorem public_press_button : EngineExec publicT03 [.down] publicT04 := by
       staticBlocker, npcAt, visibleChestAt, gapAt, activeBridgeTile, publicPos]
   have hmember : publicButton ∈ (currentRoomState publicT03).buttons := by
     rw [publicT03_room]
-    simp [publicCenterRoom]
+    simp [publicCenterRoom, publicButton]
   have hstep : Step publicT03 .down publicT04
       [.moved publicT03.player.pos (publicPos 2 6),
        .buttonPressed publicButton.id] := by
@@ -9688,8 +9960,15 @@ theorem publicT04_running : Running publicT04 := by
 @[simp] theorem publicT04_room :
     currentRoomState publicT04 =
       publicCenterRoom (openedChest publicCenterChest) true := by
+  have hroom0 : publicT03.rooms 0 =
+      publicCenterRoom (openedChest publicCenterChest) := by
+    simpa [currentRoomState, publicT03_current] using publicT03_room
   simp [publicT04, publicT03_room, publicCenterRoom, pressButtonAt,
-    publicButton, openedChest, updateCurrentRoom]
+    publicButton, openedChest, updateCurrentRoom, currentRoomState, setRoom,
+    publicT03_current, hroom0]
+
+@[simp] theorem publicT04_current : publicT04.currentRoom = 0 := by
+  simp [publicT04, publicT03_current]
 
 @[simp] theorem publicT04_pos : publicT04.player.pos = publicPos 2 6 := by
   rfl
@@ -9714,6 +9993,14 @@ theorem publicT05_running : Running publicT05 := by
       publicCenterRoom (openedChest publicCenterChest) true := by
   simpa [publicT05] using publicT04_room
 
+@[simp] theorem publicT05_current : publicT05.currentRoom = 0 := by
+  simp [publicT05, publicT04_current]
+
+@[simp] theorem publicT05_south : publicT05.rooms 1 = publicSouthRoom := by
+  simp [publicT05, publicT04, publicT03, publicT02, openChestResult,
+    publicT01, publicInitialWorld, publicRooms, updateCurrentRoom,
+    setRoom, currentRoomState, publicT03_current]
+
 theorem public_enter_south : EngineExec publicT05 [.down] publicT06 := by
   apply engineExec_useExit_once (exit := publicCenterSouth)
   · exact publicT05_running
@@ -9724,11 +10011,7 @@ theorem public_enter_south : EngineExec publicT05 [.down] publicT06 := by
   · simp [exitRequirementSatisfied, publicCenterSouth,
       requirementSatisfied, buttonIsPressed, publicT05_room,
       publicCenterRoom, publicButton]
-  · have hsouth : publicT05.rooms 1 = publicSouthRoom := by
-      simp [publicT05, publicT04, publicT03, publicT02, openChestResult,
-        publicT01, publicInitialWorld, publicRooms, updateCurrentRoom,
-        setRoom, currentRoomState]
-    simpa [publicCenterSouth, hsouth, publicSouthRoom, publicSouthKeyChest,
+  · simpa [publicCenterSouth, publicT05_south, publicSouthRoom, publicSouthKeyChest,
       publicSouthMonster, publicSouthNpc, publicSouthTrap, canEnter, inBounds,
       staticBlocker, npcAt, visibleChestAt, gapAt, activeBridgeTile,
       publicBounds, publicPos]
@@ -9740,7 +10023,11 @@ theorem publicT06_running : Running publicT06 := by
 
 @[simp] theorem publicT06_room : currentRoomState publicT06 = publicSouthRoom := by
   simp [publicT06, transitionThroughExit, publicCenterSouth,
-    currentRoomState, unlockExitInRoom, setRoom]
+    currentRoomState, unlockExitInRoom, setRoom, publicT05_current,
+    publicT05_south]
+
+@[simp] theorem publicT06_current : publicT06.currentRoom = 1 := by
+  simp [publicT06, publicCenterSouth]
 
 theorem public_route_south_to_key :
     EngineExec publicT06 (southToKey.map actionForDirection) publicT07 := by
@@ -9758,6 +10045,15 @@ theorem publicT07_running : Running publicT07 := by
 
 @[simp] theorem publicT07_room : currentRoomState publicT07 = publicSouthRoom := by
   simpa [publicT07] using publicT06_room
+
+@[simp] theorem publicT07_current : publicT07.currentRoom = 1 := by
+  simp [publicT07, publicT06_current]
+
+@[simp] theorem publicT07_keys : publicT07.player.inventory.keys = 0 := by
+  simp [publicT07, publicT06, publicT05, publicT04, publicT03, publicT02,
+    openChestResult, publicT01, publicInitialWorld, publicInitialPlayer,
+    transitionThroughExit, publicCenterSouth, spendExitRequirement,
+    publicCenterChest, collectLoot]
 
 @[simp] theorem publicT07_pos : publicT07.player.pos = publicPos 8 4 := by
   simp [publicT07, publicT06, publicCenterSouth, southToKey, publicPos,
@@ -9785,6 +10081,9 @@ theorem publicT08_running : Running publicT08 := by
   simp [publicT08, openChestResult, publicT07_room, publicSouthRoom,
     replaceChest, openedChest]
 
+@[simp] theorem publicT08_current : publicT08.currentRoom = 1 := by
+  simp [publicT08, publicT07_current]
+
 @[simp] theorem publicT08_pos : publicT08.player.pos = publicPos 8 4 := by
   simpa [publicT08] using publicT07_pos
 
@@ -9807,19 +10106,37 @@ theorem publicT09_running : Running publicT09 := by
       publicSouthRoom (openedChest publicSouthKeyChest) := by
   simpa [publicT09] using publicT08_room
 
+@[simp] theorem publicT09_current : publicT09.currentRoom = 1 := by
+  simp [publicT09, publicT08_current]
+
 @[simp] theorem publicT09_pos : publicT09.player.pos = publicPos 4 0 := by
   simp [publicT09, publicT08_pos, keyToSouthExit, publicPos,
     directionEndpoint, advance]
 
-theorem publicT09_center :
-    publicT09.rooms 0 =
+@[simp] theorem publicT06_center :
+    publicT06.rooms 0 =
       publicCenterRoom (openedChest publicCenterChest) true := by
   have hcenter : publicT05.rooms 0 =
       publicCenterRoom (openedChest publicCenterChest) true := by
-    simpa [currentRoomState] using publicT05_room
-  simp [publicT09, publicT08, openChestResult, publicT07, publicT06,
-    transitionThroughExit, publicCenterSouth, unlockExitInRoom, setRoom,
-    currentRoomState, hcenter]
+    simpa [currentRoomState, publicT05_current] using publicT05_room
+  simp [publicT06, transitionThroughExit, publicCenterSouth,
+    currentRoomState, publicT05_current, unlockExitInRoom, setRoom, hcenter]
+
+@[simp] theorem publicT07_center :
+    publicT07.rooms 0 =
+      publicCenterRoom (openedChest publicCenterChest) true := by
+  simpa [publicT07] using publicT06_center
+
+@[simp] theorem publicT08_center :
+    publicT08.rooms 0 =
+      publicCenterRoom (openedChest publicCenterChest) true := by
+  simp [publicT08, openChestResult, updateCurrentRoom, setRoom,
+    publicT07_current, publicT07_center]
+
+theorem publicT09_center :
+    publicT09.rooms 0 =
+      publicCenterRoom (openedChest publicCenterChest) true := by
+  simpa [publicT09] using publicT08_center
 
 theorem public_return_center_from_south :
     EngineExec publicT09 [.up] publicT10 := by
@@ -9843,7 +10160,11 @@ theorem publicT10_running : Running publicT10 := by
     currentRoomState publicT10 =
       publicCenterRoom (openedChest publicCenterChest) true := by
   simp [publicT10, transitionThroughExit, publicSouthNorth,
-    currentRoomState, unlockExitInRoom, setRoom, publicT09_center]
+    currentRoomState, unlockExitInRoom, setRoom, publicT09_current,
+    publicT09_center]
+
+@[simp] theorem publicT10_current : publicT10.currentRoom = 0 := by
+  simp [publicT10, publicSouthNorth]
 
 theorem public_route_center_to_east_exit :
     EngineExec publicT10 (centerToEastExit.map actionForDirection)
@@ -9867,13 +10188,31 @@ theorem publicT11_running : Running publicT11 := by
       publicCenterRoom (openedChest publicCenterChest) true := by
   simpa [publicT11] using publicT10_room
 
+@[simp] theorem publicT11_current : publicT11.currentRoom = 0 := by
+  simp [publicT11, publicT10_current]
+
 @[simp] theorem publicT11_pos : publicT11.player.pos = publicPos 9 3 := by
   simp [publicT11, publicT10, publicSouthNorth, centerToEastExit,
     publicPos, directionEndpoint, advance]
 
 theorem publicT11_has_key : 1 ≤ publicT11.player.inventory.keys := by
   simp [publicT11, publicT10, publicT09, publicT08, openChestResult,
-    publicSouthKeyChest, collectLoot]
+    publicSouthKeyChest, collectLoot, publicSouthNorth,
+    spendExitRequirement, publicT07_keys]
+
+@[simp] theorem publicT11_center :
+    publicT11.rooms 0 =
+      publicCenterRoom (openedChest publicCenterChest) true := by
+  simpa [publicT11, currentRoomState, publicT10_current] using publicT10_room
+
+@[simp] theorem publicT11_east : publicT11.rooms 3 = publicEastRoom := by
+  simp [publicT11, publicT10, publicT09, publicT08, openChestResult,
+    publicT07, publicT06, publicT05, publicT04, publicT03, publicT02,
+    openChestResult, publicT01, publicInitialWorld, publicRooms,
+    transitionThroughExit, publicSouthNorth, publicCenterSouth,
+    unlockExitInRoom, updateCurrentRoom, setRoom, currentRoomState,
+    publicT05_current, publicT06_current, publicT07_current,
+    publicT08_current, publicT09_current, publicT10_current]
 
 theorem public_enter_east_consuming_key :
     EngineExec publicT11 [.right] publicT12 := by
@@ -9884,13 +10223,7 @@ theorem public_enter_east_consuming_key :
   · simp [exitContains, publicT11_pos, publicCenterEast, publicPos]
   · right
     simpa [publicCenterEast, requirementSatisfied] using publicT11_has_key
-  · have heast : publicT11.rooms 3 = publicEastRoom := by
-      simp [publicT11, publicT10, publicT09, publicT08, openChestResult,
-        publicT07, publicT06, publicT05, publicT04, publicT03, publicT02,
-        openChestResult, publicT01, publicInitialWorld, publicRooms,
-        transitionThroughExit, publicSouthNorth, publicCenterSouth,
-        unlockExitInRoom, updateCurrentRoom, setRoom, currentRoomState]
-    simpa [publicCenterEast, heast, publicEastRoom, publicEastHealChest,
+  · simpa [publicCenterEast, publicT11_east, publicEastRoom, publicEastHealChest,
       publicEastMonster, publicEastNpc, canEnter, inBounds, staticBlocker,
       npcAt, visibleChestAt, gapAt, activeBridgeTile, publicBounds, publicPos]
 
@@ -9901,12 +10234,23 @@ theorem publicT12_running : Running publicT12 := by
 
 @[simp] theorem publicT12_room : currentRoomState publicT12 = publicEastRoom := by
   simp [publicT12, transitionThroughExit, publicCenterEast,
-    currentRoomState, unlockExitInRoom, setRoom]
+    currentRoomState, unlockExitInRoom, setRoom, publicT11_current,
+    publicT11_east]
+
+@[simp] theorem publicT12_current : publicT12.currentRoom = 3 := by
+  simp [publicT12, publicCenterEast]
 
 theorem publicT12_key_consumed : publicT12.player.inventory.keys = 0 := by
   simp [publicT12, publicT11, publicT10, publicT09, publicT08,
     openChestResult, publicSouthKeyChest, collectLoot, publicCenterEast,
-    transitionThroughExit, spendExitRequirement, spendRequirement]
+    publicSouthNorth, transitionThroughExit, spendExitRequirement,
+    spendRequirement, publicT07_keys]
+
+@[simp] theorem publicT12_center :
+    publicT12.rooms 0 = publicCenterUnlockedRoom := by
+  simp [publicT12, transitionThroughExit, publicCenterEast,
+    publicT11_current, publicT11_center, unlockExitInRoom, setRoom,
+    publicCenterUnlockedRoom]
 
 theorem public_route_east_to_heal :
     EngineExec publicT12 (eastToHeal.map actionForDirection) publicT13 := by
@@ -9924,6 +10268,13 @@ theorem publicT13_running : Running publicT13 := by
 
 @[simp] theorem publicT13_room : currentRoomState publicT13 = publicEastRoom := by
   simpa [publicT13] using publicT12_room
+
+@[simp] theorem publicT13_current : publicT13.currentRoom = 3 := by
+  simp [publicT13, publicT12_current]
+
+@[simp] theorem publicT13_center :
+    publicT13.rooms 0 = publicCenterUnlockedRoom := by
+  simpa [publicT13] using publicT12_center
 
 @[simp] theorem publicT13_pos : publicT13.player.pos = publicPos 6 1 := by
   simp [publicT13, publicT12, publicCenterEast, eastToHeal, publicPos,
@@ -9944,7 +10295,15 @@ theorem publicT14_running : Running publicT14 := by
   constructor
   · unfold alive
     change 0 < (openChestResult publicT13 publicEastHealChest).player.hp
-    simp [openChestResult, publicEastHealChest, collectLoot]
+    have hmax : publicT13.player.maxHp = 5 := by
+      simp [publicT13, publicT12, publicT11, publicT10, publicT09,
+        publicT08, publicT07, publicT06, publicT05, publicT04, publicT03,
+        publicT02, publicT01, publicInitialWorld, publicInitialPlayer]
+    have hmaxPositive : 0 < publicT13.player.maxHp := by omega
+    have hhealedPositive : 0 < publicT13.player.hp + 3 := by omega
+    simp [openChestResult, publicEastHealChest, collectLoot, hmax]
+    rw [Nat.min_def]
+    split <;> omega
   · simpa [publicT14, openChestResult] using hcomplete
 
 @[simp] theorem publicT14_room :
@@ -9952,6 +10311,14 @@ theorem publicT14_running : Running publicT14 := by
       publicEastRoom (openedChest publicEastHealChest) := by
   simp [publicT14, openChestResult, publicT13_room, publicEastRoom,
     replaceChest, openedChest]
+
+@[simp] theorem publicT14_current : publicT14.currentRoom = 3 := by
+  simp [publicT14, publicT13_current]
+
+@[simp] theorem publicT14_center :
+    publicT14.rooms 0 = publicCenterUnlockedRoom := by
+  simp [publicT14, openChestResult, updateCurrentRoom, setRoom,
+    publicT13_current, publicT13_center]
 
 @[simp] theorem publicT14_pos : publicT14.player.pos = publicPos 6 1 := by
   simpa [publicT14] using publicT13_pos
@@ -9975,19 +10342,20 @@ theorem publicT15_running : Running publicT15 := by
       publicEastRoom (openedChest publicEastHealChest) := by
   simpa [publicT15] using publicT14_room
 
+@[simp] theorem publicT15_current : publicT15.currentRoom = 3 := by
+  simp [publicT15, publicT14_current]
+
+@[simp] theorem publicT15_center_snapshot :
+    publicT15.rooms 0 = publicCenterUnlockedRoom := by
+  simpa [publicT15] using publicT14_center
+
 @[simp] theorem publicT15_pos : publicT15.player.pos = publicPos 0 4 := by
   simp [publicT15, publicT14_pos, healToEastExit, publicPos,
     directionEndpoint, advance]
 
 theorem publicT15_center :
     publicT15.rooms 0 = publicCenterUnlockedRoom := by
-  simp [publicT15, publicT14, openChestResult, publicT13, publicT12,
-    publicT11, publicT10, publicT09, publicT08, openChestResult,
-    publicT07, publicT06, publicT05, publicT04, publicT03, publicT02,
-    openChestResult, publicT01, publicInitialWorld, publicRooms,
-    transitionThroughExit, publicCenterEast, publicSouthNorth,
-    publicCenterSouth, publicCenterUnlockedRoom, unlockExitInRoom,
-    updateCurrentRoom, setRoom, currentRoomState, replaceExit]
+  exact publicT15_center_snapshot
 
 theorem public_return_center_from_east :
     EngineExec publicT15 [.left] publicT16 := by
@@ -10011,7 +10379,11 @@ theorem publicT16_running : Running publicT16 := by
 @[simp] theorem publicT16_room :
     currentRoomState publicT16 = publicCenterUnlockedRoom := by
   simp [publicT16, transitionThroughExit, publicEastWest,
-    currentRoomState, unlockExitInRoom, setRoom, publicT15_center]
+    currentRoomState, unlockExitInRoom, setRoom, publicT15_current,
+    publicT15_center]
+
+@[simp] theorem publicT16_current : publicT16.currentRoom = 0 := by
+  simp [publicT16, publicEastWest]
 
 theorem public_route_center_to_west_exit :
     EngineExec publicT16 (centerToWestExit.map actionForDirection)
@@ -10034,6 +10406,22 @@ theorem publicT17_running : Running publicT17 := by
     currentRoomState publicT17 = publicCenterUnlockedRoom := by
   simpa [publicT17] using publicT16_room
 
+@[simp] theorem publicT17_current : publicT17.currentRoom = 0 := by
+  simp [publicT17, publicT16_current]
+
+@[simp] theorem publicT17_west : publicT17.rooms 2 = publicWestRoom := by
+  simp [publicT17, publicT16, publicT15, publicT14, openChestResult,
+    publicT13, publicT12, publicT11, publicT10, publicT09, publicT08,
+    openChestResult, publicT07, publicT06, publicT05, publicT04,
+    publicT03, publicT02, openChestResult, publicT01, publicInitialWorld,
+    publicRooms, transitionThroughExit, publicEastWest, publicCenterEast,
+    publicSouthNorth, publicCenterSouth, unlockExitInRoom,
+    updateCurrentRoom, setRoom, currentRoomState,
+    publicT05_current, publicT06_current, publicT07_current,
+    publicT08_current, publicT09_current, publicT10_current,
+    publicT11_current, publicT12_current, publicT13_current,
+    publicT14_current, publicT15_current, publicT16_current]
+
 @[simp] theorem publicT17_pos : publicT17.player.pos = publicPos 0 4 := by
   simp [publicT17, publicT16, publicEastWest, centerToWestExit,
     publicPos, directionEndpoint, advance]
@@ -10046,16 +10434,7 @@ theorem public_enter_west : EngineExec publicT17 [.left] publicT18 := by
       publicCenterWest, publicCenterSouth, publicCenterRoom, replaceExit]
   · simp [exitContains, publicT17_pos, publicCenterWest, publicPos]
   · simp [exitRequirementSatisfied, publicCenterWest, requirementSatisfied]
-  · have hwest : publicT17.rooms 2 = publicWestRoom := by
-      simp [publicT17, publicT16, publicT15, publicT14, openChestResult,
-        publicT13, publicT12, publicT11, publicT10, publicT09, publicT08,
-        openChestResult, publicT07, publicT06, publicT05, publicT04,
-        publicT03, publicT02, openChestResult, publicT01,
-        publicInitialWorld, publicRooms, transitionThroughExit,
-        publicEastWest, publicCenterEast, publicSouthNorth,
-        publicCenterSouth, unlockExitInRoom, updateCurrentRoom, setRoom,
-        currentRoomState]
-    simpa [publicCenterWest, hwest, publicWestRoom, publicWestGoldChest,
+  · simpa [publicCenterWest, publicT17_west, publicWestRoom, publicWestGoldChest,
       publicWestMonsterA, publicWestMonsterB, publicWestNpc, canEnter,
       inBounds, staticBlocker, npcAt, visibleChestAt, gapAt,
       activeBridgeTile, publicBounds, publicPos]
@@ -10067,7 +10446,11 @@ theorem publicT18_running : Running publicT18 := by
 
 @[simp] theorem publicT18_room : currentRoomState publicT18 = publicWestRoom := by
   simp [publicT18, transitionThroughExit, publicCenterWest,
-    currentRoomState, unlockExitInRoom, setRoom]
+    currentRoomState, unlockExitInRoom, setRoom, publicT17_current,
+    publicT17_west]
+
+@[simp] theorem publicT18_current : publicT18.currentRoom = 2 := by
+  simp [publicT18, publicCenterWest]
 
 theorem public_route_west_to_gold :
     EngineExec publicT18 (westToGold.map actionForDirection) publicT19 := by
@@ -10085,6 +10468,9 @@ theorem publicT19_running : Running publicT19 := by
 
 @[simp] theorem publicT19_room : currentRoomState publicT19 = publicWestRoom := by
   simpa [publicT19] using publicT18_room
+
+@[simp] theorem publicT19_current : publicT19.currentRoom = 2 := by
+  simp [publicT19, publicT18_current]
 
 @[simp] theorem publicT19_pos : publicT19.player.pos = publicPos 3 6 := by
   simp [publicT19, publicT18, publicCenterWest, westToGold, publicPos,
@@ -10112,7 +10498,9 @@ theorem publicT20_running : Running publicT20 := by
   simp [publicT20, openChestResult, publicT19_room, publicWestRoom,
     replaceChest, openedChest]
 
-set_option maxHeartbeats 2000000 in
+@[simp] theorem publicT20_current : publicT20.currentRoom = 2 := by
+  simp [publicT20, publicT19_current]
+
 theorem publicT20_all_world_chests_opened : allWorldChestsOpened publicT20 := by
   simp [allWorldChestsOpened, allVisibleChestsOpened, publicT20,
     openChestResult, publicT19, publicT18, publicT17, publicT16,
@@ -10167,7 +10555,7 @@ theorem public_map_complete_certificate :
     (engineExec_append public_route_center_to_west_exit
     (engineExec_append public_enter_west
     (engineExec_append public_route_west_to_gold
-    (engineExec_append public_open_west_gold public_completion_tick))))))))))))))))))))
+    (engineExec_append public_open_west_gold public_completion_tick)))))))))))))))))))
   refine ⟨_, publicT22, hAll, ?_, ?_, ?_⟩
   · simp [WorldCompleted, publicT22, Task4.markWorldCompleted]
   · rcases publicT20_running with ⟨halive, _⟩
@@ -10418,9 +10806,10 @@ theorem environment_execution_safe
     hclosed hmember hinvariant hexec).2
 
 theorem strategy_output_safe
-    {s : WorldState} {role : CommandRole} {output : Action}
-    (h : CommandSafe s role output) :
-    CommandSafe s role output := h
+    {c : Controller} {facts : CandidateFacts} {s : WorldState}
+    {decision : PolicyDecision}
+    (h : PolicyRefinesAgent c facts s decision) :
+    CommandSafe s decision.role decision.output := h.2
 
 theorem policy_refines_agent
     {policy : PolicyKernel Controller}
@@ -10470,9 +10859,10 @@ theorem environment_execution_safe
     hclosed hmember hinvariant hexec).2
 
 theorem strategy_output_safe
-    {s : WorldState} {role : CommandRole} {output : Action}
-    (h : CommandSafe s role output) :
-    CommandSafe s role output := h
+    {kind : RoomKind} {c : Controller} {facts : CandidateFacts}
+    {s : WorldState} {decision : PolicyDecision}
+    (h : PolicyRefinesAgent kind c facts s decision) :
+    CommandSafe s decision.role decision.output := h.2
 
 theorem policy_refines_agent
     {policy : PolicyKernel Controller}
@@ -10522,9 +10912,10 @@ theorem environment_execution_safe
     hclosed hmember hinvariant hexec).2
 
 theorem strategy_output_safe
-    {s : WorldState} {mode : MoveMode} {output : Action}
-    (h : PolicyOutputSafe s mode output) :
-    PolicyOutputSafe s mode output := h
+    {survival : SurvivalMemory} {e : CandidateEvidence}
+    {s : WorldState} {decision : PolicyDecision}
+    (h : PolicyRefinesAgent survival e s decision) :
+    PolicyOutputSafe s decision.mode decision.output := h.2
 
 theorem policy_refines_agent
     {policy : PolicyKernel (Memory × SurvivalMemory)}
