@@ -1,0 +1,636 @@
+% !TeX program = xelatex
+\documentclass[UTF8]{ctexart}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{基于状态图的广义 BFS 形式化}
+\author{}
+\date{}
+
+\newtheoremstyle{nesylinkblock}
+  {1.2em}
+  {1.0em}
+  {\normalfont}
+  {}
+  {\bfseries}
+  {}
+  {0.6em}
+  {\thmname{【#1}\thmnumber{ #2}\thmnote{（#3）}】}
+
+\theoremstyle{nesylinkblock}
+\newtheorem{definition}{定义}
+\newtheorem{assumption}{假设}
+\newtheorem{lemma}{引理}
+\newtheorem{theorem}{定理}
+\newtheorem{remark}{说明}
+
+\DeclareMathOperator{\Goal}{Goal}
+\DeclareMathOperator{\Dead}{Dead}
+\DeclareMathOperator{\dist}{dist}
+
+\newsavebox{\exampleboxcontent}
+\newenvironment{examplebox}
+  {\begin{center}\begin{lrbox}{\exampleboxcontent}\begin{minipage}{0.92\linewidth}
+   \textbf{例子：}\par\smallskip}
+  {\end{minipage}\end{lrbox}\fbox{\usebox{\exampleboxcontent}}\end{center}}
+
+\begin{document}
+\maketitle
+
+\section{核心思想}
+
+我们不直接把 BFS 理解成在地图格子上搜索，而是把整个游戏过程看成一个
+有向图搜索问题。图中的一个节点不是单纯的位置，而是一个完整游戏状态。
+一次玩家动作对应图中的一条有向边。
+
+直观上：
+\[
+\begin{array}{ccccc}
+s_0 & \xrightarrow{a_0} & s_1 & \xrightarrow{a_1} & s_2 \\
+    &                   & \downarrow a_2        &                   & \downarrow a_3 \\
+    &                   & s_3                   & \xrightarrow{a_4} & g
+\end{array}
+\]
+其中每个 $s_i$ 是一种可能的游戏状态，边上的 $a_i$ 是动作，$g$ 是胜利状态。
+BFS 要证明的是：如果从初始节点 $s_0$ 沿着这些边能够到达某个胜利节点，
+那么 BFS 一定能在有限层数内发现一个胜利节点。
+
+\section{游戏图模型}
+
+\begin{definition}[游戏状态图]
+给定地图 $M$，定义其游戏状态图为六元组
+\[
+  \mathcal{H}_M = (V_M, A, E_M, s_0, G_M, D_M).
+\]
+其中：
+\begin{itemize}[leftmargin=2em]
+  \item $V_M$ 是有限状态集合；
+  \item $A$ 是有限动作集合；
+  \item $E_M \subseteq V_M\times A\times V_M$ 是带动作标签的有向边集合；
+  \item $s_0\in V_M$ 是初始状态；
+  \item $G_M\subseteq V_M$ 是胜利状态集合；
+  \item $D_M\subseteq V_M$ 是失败状态集合。
+\end{itemize}
+\end{definition}
+
+\begin{examplebox}
+在 Task 1 中，一个节点可以表示“玩家在房间中坐标 $(3,4)$、血量为 $5$、
+尚未拿钥匙、宝箱未打开、北侧锁门未打开”的完整局面。这个局面是 $V_M$
+中的一个元素，而不是单纯的坐标 $(3,4)$。
+\end{examplebox}
+
+\begin{remark}
+这里的节点 $v\in V_M$ 应当包含完整运行时信息，例如玩家位置、房间、血量、
+背包、宝箱是否打开、怪物是否存活、门是否开启、桥的状态以及终止标记。
+如果两个运行时配置未来行为可能不同，它们就必须是两个不同节点。
+\end{remark}
+
+\begin{definition}[动作边]
+若
+\[
+  (u,a,v)\in E_M,
+\]
+则记作
+\[
+  u \xrightarrow{a}_M v.
+\]
+含义是：在状态 $u$ 下执行动作 $a$ 后，游戏可以进入状态 $v$。
+若动作被阻挡，例如撞墙或无法开门，也允许存在自环
+\[
+  u \xrightarrow{a}_M u.
+\]
+\end{definition}
+
+\begin{examplebox}
+若状态 $u$ 中玩家站在宝箱左侧，动作 $\mathsf{A}$ 会打开宝箱并得到钥匙，
+则存在边 $u\xrightarrow{\mathsf{A}}_M v$，其中 $v$ 与 $u$ 的区别是宝箱已打开、
+钥匙数增加。
+\end{examplebox}
+
+\begin{definition}[动作集合]
+NesyLink 的基本动作集合可以写为
+\[
+  A=
+  \{
+    \mathsf{wait},
+    \mathsf{up},
+    \mathsf{down},
+    \mathsf{left},
+    \mathsf{right},
+    \mathsf{A},
+    \mathsf{B}
+  \}.
+\]
+\end{definition}
+
+\begin{examplebox}
+如果玩家向右移动一帧，对应动作是 $\mathsf{right}$；如果玩家与宝箱相邻并交互，
+对应动作是 $\mathsf{A}$。
+\end{examplebox}
+
+\begin{definition}[目标与失败谓词]
+胜利状态与失败状态分别由谓词定义：
+\[
+  G_M=\{v\in V_M\mid \Goal_M(v)\},
+  \qquad
+  D_M=\{v\in V_M\mid \Dead_M(v)\}.
+\]
+例如，$\Goal_M(v)$ 可以表示到达出口、打开最终宝箱或打开所有宝箱；
+$\Dead_M(v)$ 可以表示血量为 $0$ 或状态已经无法继续展开。
+\end{definition}
+
+\begin{examplebox}
+在 Task 4 中，若状态 $v$ 记录最终宝箱已经打开，则 $v\in G_M$；若状态 $v$
+记录玩家血量为 $0$，则 $v\in D_M$。
+\end{examplebox}
+
+\section{图上的路径}
+
+\begin{definition}[路径]
+长度为 $n$ 的路径是节点序列
+\[
+  \pi=(v_0,v_1,\ldots,v_n)
+\]
+以及动作序列
+\[
+  \alpha=(a_0,a_1,\ldots,a_{n-1})
+\]
+满足
+\[
+  \forall i<n,\quad v_i\xrightarrow{a_i}_M v_{i+1}.
+\]
+\end{definition}
+
+\begin{examplebox}
+若 $s_0\xrightarrow{\mathsf{right}}s_1\xrightarrow{\mathsf{right}}s_2
+\xrightarrow{\mathsf{A}}s_3$，则
+$(s_0,s_1,s_2,s_3)$ 是一条长度为 $3$ 的路径，对应动作序列为
+$(\mathsf{right},\mathsf{right},\mathsf{A})$。
+\end{examplebox}
+
+\begin{definition}[合法路径]
+路径 $\pi=(v_0,\ldots,v_n)$ 称为合法路径，当且仅当所有需要继续展开的中间
+节点都不是失败状态：
+\[
+  \forall i<n,\quad v_i\notin D_M.
+\]
+终点 $v_n$ 可以是胜利状态，也可以是失败状态；但若目标是通关路径，则要求
+$v_n\in G_M$。
+\end{definition}
+
+\begin{examplebox}
+如果一条路径中间某一步已经到达血量为 $0$ 的状态，那么之后不能再把它当作
+可继续规划的通关路径；这条路径不满足这里的合法可扩展要求。
+\end{examplebox}
+
+\begin{definition}[可达关系]
+若存在一条合法路径从 $u$ 到 $v$，则称 $v$ 从 $u$ 可达，记作
+\[
+  u\leadsto_M v.
+\]
+\end{definition}
+
+\begin{examplebox}
+如果玩家可以从初始状态经过“向右、向右、按 A、向上”到达开门后的状态 $v$，
+则记作 $s_0\leadsto_M v$。
+\end{examplebox}
+
+\begin{definition}[图距离]
+若 $u\leadsto_M v$，定义
+\[
+  \dist_M(u,v)
+  =
+  \min\{n\in\mathbb{N}\mid
+  \text{存在长度为 }n\text{ 的合法路径从 }u\text{ 到 }v\}.
+\]
+\end{definition}
+
+\begin{examplebox}
+如果从 $u$ 到 $v$ 最少需要执行 $5$ 个动作，而不存在 $4$ 步以内的合法路径，
+则 $\dist_M(u,v)=5$。
+\end{examplebox}
+
+\section{BFS 的图层定义}
+
+BFS 可以完全用图层来定义，而不必依赖某个具体队列实现。
+
+\begin{definition}[第 $n$ 层前沿]
+从 $s_0$ 出发，定义 BFS 第 $n$ 层前沿 $F_n$ 和累计已发现集合 $R_n$：
+\[
+  F_0=\{s_0\},
+  \qquad
+  R_0=\{s_0\}.
+\]
+对 $n\ge0$，递归定义
+\[
+  F_{n+1}
+  =
+  \{v\in V_M\mid
+    \exists u\in F_n,\exists a\in A,\;
+    u\notin D_M\land u\xrightarrow{a}_M v
+  \}
+  \setminus R_n,
+\]
+\[
+  R_{n+1}=R_n\cup F_{n+1}.
+\]
+\end{definition}
+
+\begin{examplebox}
+若 $F_0=\{s_0\}$，从 $s_0$ 一步能到 $s_1$ 和 $s_2$，则
+$F_1=\{s_1,s_2\}$。若从 $s_1,s_2$ 再走一步新到达 $s_3$，且 $s_3$ 以前没出现过，
+则 $s_3\in F_2$。
+\end{examplebox}
+
+\begin{remark}
+$F_n$ 表示 BFS 在第 $n$ 层新发现的状态；$R_n$ 表示 BFS 到第 $n$ 层为止已经
+发现过的全部状态。式子里的 $\setminus R_n$ 表示已经发现过的状态不再重复
+加入前沿。
+\end{remark}
+
+\begin{definition}[BFS 返回规则]
+BFS 按照 $F_0,F_1,F_2,\ldots$ 的顺序检查：
+\begin{itemize}[leftmargin=2em]
+  \item 若存在最小 $n$ 使得 $F_n\cap G_M\ne\varnothing$，则返回任意
+  $g\in F_n\cap G_M$；
+  \item 若存在 $n$ 使得 $F_n=\varnothing$，且此前所有层都没有胜利状态，
+  则返回失败。
+\end{itemize}
+\end{definition}
+
+\begin{examplebox}
+如果 $F_3$ 中第一次出现某个胜利节点 $g$，那么 BFS 返回 $g$；如果某一层
+$F_n=\varnothing$ 且之前没有任何胜利节点，则 BFS 返回失败。
+\end{examplebox}
+
+\section{BFS 的关键不变量}
+
+\begin{definition}[长度有界可达集合]
+定义
+\[
+  \mathsf{Reach}_{\le n}(s_0)
+  =
+  \{v\in V_M\mid
+  \text{存在长度不超过 }n\text{ 的合法路径从 }s_0\text{ 到 }v\}.
+\]
+定义
+\[
+  \mathsf{Reach}_{=n}(s_0)
+  =
+  \{v\in V_M\mid \dist_M(s_0,v)=n\}.
+\]
+\end{definition}
+
+\begin{examplebox}
+$\mathsf{Reach}_{\le2}(s_0)$ 包含从初始状态 $0$ 步、$1$ 步或 $2$ 步能到达的
+全部节点；$\mathsf{Reach}_{=2}(s_0)$ 只包含最短距离恰好为 $2$ 的节点。
+\end{examplebox}
+
+\begin{lemma}[已发现集合不变量]
+对任意 $n\in\mathbb{N}$，
+\[
+  R_n=\mathsf{Reach}_{\le n}(s_0).
+\]
+\end{lemma}
+
+\noindent\textbf{直观解释：}
+BFS 到第 $n$ 层为止见过的节点，正好就是从起点最多走 $n$ 步能到的所有节点。
+
+\begin{examplebox}
+如果 $R_2=\{s_0,s_1,s_2,s_3\}$，那么这表示这些节点都可以在两步以内从
+$s_0$ 到达；反过来，任何两步以内能到达的节点也必须已经在 $R_2$ 中。
+\end{examplebox}
+
+\begin{proof}
+对 $n$ 作归纳。
+
+当 $n=0$ 时，$R_0=\{s_0\}$，而长度不超过 $0$ 的合法路径只能停留在
+$s_0$，故结论成立。
+
+设结论对 $n$ 成立。由定义，$F_{n+1}$ 由所有 $F_n$ 中非失败节点的一步后继
+构成，并删除已在 $R_n$ 中出现的节点。因此 $R_{n+1}=R_n\cup F_{n+1}$ 正好
+加入所有长度为 $n+1$ 且之前未出现的可达节点。结合归纳假设
+$R_n=\mathsf{Reach}_{\le n}(s_0)$，可得
+\[
+  R_{n+1}=\mathsf{Reach}_{\le n+1}(s_0).
+\]
+\end{proof}
+
+\begin{lemma}[前沿集合不变量]
+对任意 $n\in\mathbb{N}$，
+\[
+  F_n=\mathsf{Reach}_{=n}(s_0).
+\]
+\end{lemma}
+
+\noindent\textbf{直观解释：}
+BFS 第 $n$ 层新发现的节点，正好是离起点最短距离为 $n$ 的节点。
+
+\begin{examplebox}
+如果一个节点第一次在 $F_4$ 出现，那么它不能在 $0,1,2,3$ 步内到达；
+它距离起点的最短距离就是 $4$。
+\end{examplebox}
+
+\begin{proof}
+$n=0$ 时，$F_0=\{s_0\}$，即距离为 $0$ 的节点集合。
+
+设 $F_n=\mathsf{Reach}_{=n}(s_0)$。由递归定义，$F_{n+1}$ 是从 $F_n$ 中节点
+走一步得到、且未在 $R_n$ 中出现过的节点。由上一引理，$R_n$ 已经包含所有
+距离不超过 $n$ 的节点。因此 $F_{n+1}$ 中的节点距离不能小于等于 $n$；
+另一方面它们可由距离为 $n$ 的节点一步到达，所以距离至多为 $n+1$。
+故它们恰好是距离为 $n+1$ 的节点。
+\end{proof}
+
+\section{正确性定理}
+
+\begin{assumption}[有限状态假设]
+$V_M$ 是有限集合。
+\end{assumption}
+
+\begin{theorem}[终止性]
+若 $V_M$ 有限，则 BFS 必定终止。
+\end{theorem}
+
+\noindent\textbf{直观解释：}
+图里节点总数有限，BFS 又不会重复加入同一个节点，所以不可能无限搜下去。
+
+\begin{examplebox}
+如果某个地图状态图只有 $100$ 个节点，那么 BFS 最多只能把这 $100$ 个节点加入
+已发现集合，不可能产生第 $101$ 个新节点。
+\end{examplebox}
+
+\begin{proof}
+集合序列
+\[
+  R_0\subseteq R_1\subseteq R_2\subseteq\cdots\subseteq V_M
+\]
+单调递增。每当 $F_{n+1}\ne\varnothing$ 时，$R_{n+1}$ 至少比 $R_n$ 多一个
+节点。由于 $V_M$ 有限，这种严格增加只能发生有限次。因此某一层必有
+$F_n=\varnothing$，除非此前已经发现目标。故 BFS 终止。
+\end{proof}
+
+\begin{theorem}[可靠性]
+若 BFS 返回 $g$，则
+\[
+  s_0\leadsto_M g
+  \quad\text{且}\quad
+  g\in G_M.
+\]
+\end{theorem}
+
+\noindent\textbf{直观解释：}
+BFS 找到的答案一定是真的通关状态，而且这个状态一定能从初始状态沿合法边走到。
+
+\begin{examplebox}
+如果 BFS 返回某个状态 $g$，并说它是通关状态，那么沿着父指针反推一定能得到
+一串真实动作，例如 $(\mathsf{right},\mathsf{A},\mathsf{up})$，从 $s_0$
+合法走到 $g$。
+\end{examplebox}
+
+\begin{proof}
+BFS 只会在某层 $F_n$ 与 $G_M$ 相交时返回 $g\in F_n\cap G_M$。由前沿集合
+不变量，$g\in F_n$ 蕴含 $s_0\leadsto_M g$。同时 $g\in G_M$ 由返回规则直接
+给出。
+\end{proof}
+
+\begin{theorem}[完备性]
+若存在 $g\in G_M$ 使得
+\[
+  s_0\leadsto_M g,
+\]
+则 BFS 一定会返回某个胜利状态。
+\end{theorem}
+
+\noindent\textbf{直观解释：}
+只要图中确实存在一条从初始状态到胜利状态的路径，BFS 就一定不会漏掉它。
+
+\begin{examplebox}
+如果存在一条 $7$ 步通关路线，那么胜利节点会出现在 $F_7$ 或更早的某一层；
+BFS 不会在可达通关路线存在时错误地报告失败。
+\end{examplebox}
+
+\begin{proof}
+由 $s_0\leadsto_M g$，$\dist_M(s_0,g)$ 存在。令
+\[
+  d=\dist_M(s_0,g).
+\]
+由前沿集合不变量，
+\[
+  g\in F_d.
+\]
+又因为 $g\in G_M$，所以
+\[
+  F_d\cap G_M\ne\varnothing.
+\]
+因此 BFS 至迟在第 $d$ 层返回胜利状态。
+\end{proof}
+
+\begin{theorem}[失败返回正确性]
+若 BFS 返回失败，则不存在可达胜利状态：
+\[
+  \neg\exists g\in G_M,\; s_0\leadsto_M g.
+\]
+\end{theorem}
+
+\noindent\textbf{直观解释：}
+如果 BFS 搜完整个可达区域都没有通关节点，那么不是 BFS 漏了，而是这个图中
+本来就没有可达通关节点。
+
+\begin{examplebox}
+如果所有从 $s_0$ 能到达的节点都已经被加入某个 $R_n$，其中没有任何节点属于
+$G_M$，那么这个初始状态下不存在合法通关路径。
+\end{examplebox}
+
+\begin{proof}
+反设存在 $g\in G_M$ 且 $s_0\leadsto_M g$。由完备性定理，BFS 必定返回某个
+胜利状态，与返回失败矛盾。
+\end{proof}
+
+\begin{theorem}[最短性]
+若 BFS 首次在第 $n$ 层返回胜利状态，则
+\[
+  n=
+  \min\{\dist_M(s_0,g)\mid g\in G_M,\;s_0\leadsto_M g\}.
+\]
+\end{theorem}
+
+\noindent\textbf{直观解释：}
+BFS 是一层一层扩展的，所以第一次遇到胜利节点时，走的步数一定最少。
+
+\begin{examplebox}
+如果 BFS 第一次在 $F_5$ 找到胜利节点，那么不存在 $1$ 到 $4$ 步的通关路线；
+返回的路线长度就是最短通关步数 $5$。
+\end{examplebox}
+
+\begin{proof}
+首次在第 $n$ 层返回，说明对所有 $k<n$，
+\[
+  F_k\cap G_M=\varnothing.
+\]
+由前沿集合不变量，所有距离为 $k<n$ 的节点都在对应 $F_k$ 中。因此不存在
+距离小于 $n$ 的可达胜利状态。又第 $n$ 层存在胜利状态，所以最短距离为 $n$。
+\end{proof}
+
+\section{分步 BFS 定理}
+
+许多任务具有明确的阶段性条件。例如，若必须先获得钥匙才能打开锁门，则所有
+通关路径都必须先经过某个“已经拿到钥匙”的状态。此类条件可以形式化为
+里程碑集合。
+
+\begin{definition}[里程碑集合]
+设 $P_M\subseteq V_M$。若状态 $p\in P_M$ 表示某个中间条件已经成立，则称
+$P_M$ 为该条件对应的里程碑集合。
+\end{definition}
+
+\begin{examplebox}
+令 $P_M=\{v\in V_M\mid v\text{ 中玩家已经持有钥匙}\}$。那么 $P_M$ 表示
+“钥匙已经获得”这一中间条件。
+\end{examplebox}
+
+\begin{definition}[必要里程碑]
+称 $P_M$ 是从 $s_0$ 到 $G_M$ 的必要里程碑，当且仅当任意从 $s_0$ 到胜利状态
+$g\in G_M$ 的合法路径
+\[
+  (v_0,v_1,\ldots,v_n),\qquad v_0=s_0,\quad v_n=g
+\]
+都存在某个 $i\le n$ 使得
+\[
+  v_i\in P_M.
+\]
+\end{definition}
+
+\begin{examplebox}
+如果锁门只有在玩家持有钥匙后才能通过，那么任何到达锁门后胜利状态的路径，
+都必须先经过某个“已经拿到钥匙”的状态。因此“已持有钥匙”是必要里程碑。
+\end{examplebox}
+
+\begin{theorem}[分步 BFS 定理]
+设 $P_M$ 是从 $s_0$ 到 $G_M$ 的必要里程碑。则存在可达胜利状态当且仅当存在
+某个里程碑状态 $p\in P_M$ 和某个胜利状态 $g\in G_M$，使得
+\[
+  s_0\leadsto_M p
+  \qquad\text{且}\qquad
+  p\leadsto_M g.
+\]
+进一步，若最短距离均存在，则有
+\[
+  \min_{g\in G_M}\dist_M(s_0,g)
+  =
+  \min_{\substack{p\in P_M,\; g\in G_M\\
+                  s_0\leadsto_M p,\; p\leadsto_M g}}
+  \bigl(\dist_M(s_0,p)+\dist_M(p,g)\bigr).
+\]
+\end{theorem}
+
+\noindent\textbf{直观解释：}
+如果通关前必然要先满足某个中间条件，那么完整搜索可以拆成两段：先搜索到满足
+中间条件的状态，再从该状态继续搜索到胜利状态。
+
+\begin{examplebox}
+在钥匙门任务中，$P_M$ 是“已经拿到钥匙”的状态集合，$G_M$ 是“通过锁门并胜利”
+的状态集合。由于不开钥匙无法过门，所以通关路径可以分解为：
+\[
+  \text{初始状态}\leadsto\text{拿到钥匙}
+  \leadsto\text{打开锁门并通关}.
+\]
+\end{examplebox}
+
+\begin{proof}
+先证存在性等价。
+
+若存在 $p\in P_M$ 与 $g\in G_M$ 使得 $s_0\leadsto_M p$ 且 $p\leadsto_M g$，
+则由两条合法路径的拼接可得 $s_0\leadsto_M g$，故存在可达胜利状态。
+
+反过来，设存在 $g\in G_M$ 且 $s_0\leadsto_M g$。取一条从 $s_0$ 到 $g$ 的
+合法路径
+\[
+  (v_0,v_1,\ldots,v_n),\qquad v_0=s_0,\quad v_n=g.
+\]
+由于 $P_M$ 是必要里程碑，存在 $i\le n$ 使得 $v_i\in P_M$。令 $p=v_i$。
+路径前缀给出 $s_0\leadsto_M p$，路径后缀给出 $p\leadsto_M g$。
+
+再证最短距离等式。任取右侧中的 $p,g$，由路径拼接可得
+\[
+  \dist_M(s_0,g)\le \dist_M(s_0,p)+\dist_M(p,g),
+\]
+故左侧不大于右侧。另一方面，取一条从 $s_0$ 到某个胜利状态 $g$ 的最短路径。
+由必要里程碑性质，该路径经过某个 $p\in P_M$。设该路径长度为 $n$，其中
+$p$ 出现在第 $i$ 个位置，则
+\[
+  \dist_M(s_0,p)\le i,\qquad
+  \dist_M(p,g)\le n-i.
+\]
+因此
+\[
+  \dist_M(s_0,p)+\dist_M(p,g)\le n.
+\]
+对所有最短胜利路径取最小，即得右侧不大于左侧。两边相等。
+\end{proof}
+
+\begin{remark}
+若只运行一次 BFS 找到“最近的”里程碑状态 $p$，并且从该 $p$ 出发的第二段
+BFS 成功找到目标，则两段拼接所得路径一定是合法的；但它未必是全局最短。
+全局最短的分步版本应最小化
+\[
+  \dist_M(s_0,p)+\dist_M(p,g).
+\]
+若里程碑状态唯一，或所有最近里程碑都能以相同代价继续到达目标，则直接
+“先找钥匙、再找门”与全程 BFS 在路径长度上等价。
+\end{remark}
+
+\section{与 NesyLink 实现的关系}
+
+实际程序通常不会预先枚举整个 $V_M$ 和 $E_M$，而是实现后继生成器
+\[
+  \mathsf{next}_M:V_M\to\mathcal{P}(A\times V_M).
+\]
+它需要满足
+\[
+  (a,v)\in\mathsf{next}_M(u)
+  \quad\Longleftrightarrow\quad
+  u\xrightarrow{a}_M v.
+\]
+在该条件下，后继生成器版 BFS 与上述图模型版 BFS 等价。
+
+对于 NesyLink 的像素输入，CNN 或像素规则负责把图像转化为符号状态。
+BFS 证明本身不证明视觉识别永远正确，而是证明：
+\[
+  \text{如果符号状态和转移边刻画正确，则 BFS 在该状态图上正确。}
+\]
+
+\section{非确定性说明}
+
+若环境含有随机怪物移动，则 $E_M$ 可以包含所有可能后继。此时普通 BFS 证明的
+是存在性可达：
+\[
+  \exists \text{一条路径到达 }G_M.
+\]
+若要证明``无论怪物如何行动都能胜利''，则问题变为游戏图上的必胜策略证明：
+\[
+  \exists\sigma,\forall \text{环境选择},\quad
+  \text{执行策略 }\sigma\text{ 后到达 }G_M.
+\]
+该问题需要 AND--OR 搜索或胜利域不动点，而不是普通 BFS。
+
+\section{结论}
+
+用图模型表述，广义 BFS 的核心定理可以压缩为：
+\[
+  \forall M,\;
+  \bigl(
+    V_M \text{ finite}
+    \land
+    E_M \text{ correctly models one-step transitions}
+    \land
+    \exists g\in G_M,\;s_0\leadsto_M g
+  \bigr)
+  \Rightarrow
+  \text{BFS finds a goal state}.
+\]
+也就是说：对任意有限游戏状态图，只要通关节点从初始节点可达，BFS 就一定能
+发现通关节点；若 BFS 搜索失败，则不存在可达通关节点。
+
+\end{document}
