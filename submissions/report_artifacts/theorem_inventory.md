@@ -1,12 +1,14 @@
 # 472 条主要 Lean 定理清单
 
-来源：`docs/Mathematical_logic/examples/NesyLinkEnvironment.lean`。
+来源：`submissions/examples/NesyLinkEnvironment.lean`。这是项目的主要形式化与证明
+文件；辅助性的通用搜索证明见 `submissions/examples/BFSFormalization.lean`，不计入
+本清单的 472 条主文件定理。
 
 本清单按项目既定口径收录源码中 `472` 个“行首且无前置 attribute 的
 `theorem`”主要声明；源码另有 202 个带 attribute 的辅助 `theorem` 和 10 个
 `private theorem`，不计入本表的 472。源码还有 19 个可计算 `example` 回归项，
 其覆盖范围另在主报告列出。
-源码以提交 `36e29e3` 为基线并包含当前 Lean 修复；下列行号按已通过 `lean` 与
+源码以提交 `f285cb8` 为基线并包含当前提交文件；下列行号按已通过 `lean` 与
 `lake env lean` 编译的当前工作树重新生成。实际命令与哈希见
 [`reproducibility.md`](reproducibility.md)。
 

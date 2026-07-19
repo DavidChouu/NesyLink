@@ -51,7 +51,7 @@ def main() -> None:
         TargetCase(
             name="task2_default_after_kill_open_chest",
             task_id="mathematical_logic/task_2",
-            policy_path=PROJECT_ROOT / "docs/Mathematical_logic/examples/task2_fsm_bfs_agent.py",
+            policy_path=PROJECT_ROOT / "submissions/examples/task2_agent.py",
             seed=args.seed,
             map_variant="default",
             max_steps=500,
@@ -61,7 +61,7 @@ def main() -> None:
         TargetCase(
             name="task2_spatial_a_exit_alignment",
             task_id="mathematical_logic/task_2",
-            policy_path=PROJECT_ROOT / "docs/Mathematical_logic/examples/task2_fsm_bfs_agent.py",
+            policy_path=PROJECT_ROOT / "submissions/examples/task2_agent.py",
             seed=args.seed,
             map_variant="spatial_a",
             max_steps=500,
@@ -71,7 +71,7 @@ def main() -> None:
         TargetCase(
             name="task4_spatial_c_final_chest",
             task_id="mathematical_logic/task_4",
-            policy_path=PROJECT_ROOT / "docs/Mathematical_logic/examples/task4_fsm_bfs_agent.py",
+            policy_path=PROJECT_ROOT / "submissions/examples/task4_agent.py",
             seed=args.seed + 2,
             map_variant="spatial_c",
             max_steps=2000,
