@@ -1,7 +1,8 @@
 # 复现记录
 
-本附件记录 2026-07-16 在仓库根目录完成的正式测评、版本、文件指纹和验收结果。
-正式性能统计只以同目录的 `robustness_suite_eval.json` 为数据源。
+本附件记录 2026-07-16 在仓库根目录完成的正式测评、版本、文件指纹和验收结果，
+并补记 2026-07-17 的 Lean 公开输入接口修复。正式性能统计只以同目录的
+`robustness_suite_eval.json` 为数据源。
 
 ## 1. 代码版本与工作区边界
 
@@ -11,8 +12,9 @@
 - 提交时间：`2026-07-16T03:43:36+08:00`
 - 提交标题：`Lean`
 - 当前工作树以该提交为基线，修复了 `NesyLinkEnvironment.lean` 的语法、Task4/5
-  公开状态证书和 Task3/4/5 安全汇总接口，并同步报告附件；五个 Python
-  Policy 和正式测评 JSON 未修改。
+  公开状态证书、Task3/4/5 安全汇总接口，以及策略更新函数读取完整
+  `WorldState` 的接口问题，并同步报告附件；五个 Python Policy 和正式测评
+  JSON 未修改。
 
 ## 2. 软件与硬件
 
@@ -28,6 +30,11 @@
 | PyYAML | 6.0.3 |
 | Lean | 4.32.0，commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35` |
 | Lake | 5.0.0-src+8c9756b |
+
+表中版本是 2026-07-16 正式记录。2026-07-17 的公开输入接口修复另用本机现有
+Lean 4.31.0（commit `68218e8`）和对应 Lake 5.0.0 完整复验；两条编译命令均
+退出 0。尝试下载 4.32.0 以重复交叉验证时下载未完成，因此不把修改后的新哈希
+虚构为已在 4.32.0 下重跑。
 
 正式 Policy 调用分类器时使用代码默认的 CPU inference device；checkpoint 的训练
 元数据记录训练 device 为 CUDA。两者不是同一次运行配置，不应混淆。
@@ -119,12 +126,14 @@ lean docs/Mathematical_logic/examples/NesyLinkEnvironment.lean
 lake env lean docs/Mathematical_logic/examples/NesyLinkEnvironment.lean
 ```
 
-最新再次复验时，两条命令均退出 0。直接 `lean` 用时约 18.4 秒，
-`lake env lean` 用时约 18.4 秒（同时启动，墙钟时间受当时负载影响）。
-两份日志均有 79 条 Lean linter 的 `unnecessarySimpa`/`unusedSimpArgs` 等风格提示；
-`error:`、`unsolved goals`、`unexpected token` 和未决元变量匹配数均为 0。
+2026-07-17 修改公开输入接口后，两条命令在 Lean 4.31.0 下均退出 0。
+两份日志均有 79 条 Lean linter 提示，其中 49 条 `unnecessarySimpa`、30 条
+`unusedSimpArgs`；`error:`、`unsolved goals`、`unexpected token` 和未决
+元变量匹配数均为 0。
 
 修复没有提高 heartbeat、删除定理、引入最终状态假设或将目标改为 `True`。
+`PolicyKernel.decide` 只接收当前已验证观测，`PolicyKernel.update` 只接收下一
+已验证观测、缩放 reward 和公开 inventory；完整 `WorldState` 不再进入策略函数。
 Task4 最终证书用五个房间快照组合；Task5 用阶段化 `currentRoom`/房间投影证书；
 五关公开证书仍连接真实 `EngineExec`、`WorldCompleted`、`alive` 和
 `ValidState`。
@@ -162,7 +171,7 @@ rg -c '^example ' \
 | `task3_fsm_bfs_agent.py` | `0547d4bbf524e1f6e0eed66be85325ae2c76331973966ec6696a7ae4a42478b2` |
 | `task4_fsm_bfs_agent.py` | `e67386347c9b693fd8824655eeb571e2a5825abc3d255d0cbafb3efc33819ceb` |
 | `task5_fsm_bfs_agent.py` | `7317291d1c54ba6f313097a9a17f236b27d09e8c897c9ea4256feb877b7d7030` |
-| `NesyLinkEnvironment.lean` | `a511b2ceae14b13c11ea8ab631c216f9c0e056fcf6e14fe871ff7ecfc3630f0d` |
+| `NesyLinkEnvironment.lean` | `ca36b2697564878a93987872f581c2f1525b064f50db622107c02355c82e7b06` |
 | default `.weights.pt` | `c145847a722b48d5f9d4199be2832007e2866b94a8047fb4e860c124c27440d0` |
 | metadata `.pt` | `ddc9a88dd44b3394f23bb3bdacfc10e8f73d793fdff6fd3f41ea4535fb622c68` |
 | `robustness_suite_eval.json` | `c9751a9f5703d545917faf0d3a28e24c8bde76ab2f964182f9ddbc54e70de028` |
@@ -178,8 +187,8 @@ rg -c '^example ' \
 | 主要定理声明/清单数量 | PASS，472/472；另披露 202 attribute + 10 private |
 | 可计算回归样例 | PASS，19 个 `example` |
 | Lean 禁止项/`maxHeartbeats` 扫描 | PASS，0 个匹配 |
-| `lean` 独立编译 | PASS，退出 0 |
-| `lake env lean` 编译 | PASS，退出 0 |
+| `lean` 独立编译 | PASS，Lean 4.31.0，退出 0 |
+| `lake env lean` 编译 | PASS，Lean 4.31.0，退出 0 |
 | 语法/编译/未解目标/元变量错误 | PASS，0 个匹配；79 条非致命 linter 提示 |
 | `git diff --check` | PASS，退出 0 |
 

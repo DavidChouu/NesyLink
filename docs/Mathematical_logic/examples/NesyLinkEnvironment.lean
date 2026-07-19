@@ -2639,7 +2639,9 @@ theorem bfs_complete_from_frontier_invariant
 
 神经网络本身不进入可信基。`ObservationRefinesWorld` 是符号观测进入
 planner 时必须满足的精化契约；`ClosedLoopStep` 则强制策略输出先经过
-`ControllerCommandSafe`，再由真实 `EngineTick` 执行。
+`ControllerCommandSafe`，再由真实 `EngineTick` 执行。策略只能接收已验证
+观测、环境返回的 reward 和公开 inventory；真实 `WorldState` 只用于陈述
+这些公开输入正确，不进入策略的计算接口。
 -/
 
 abbrev physicalEnterable := canEnter
@@ -2665,6 +2667,16 @@ def ObservationRefinesWorld
   obs.inventory = s.player.inventory ∧
   (∀ p, obs.walkable p ↔ physicalEnterable (currentRoomState s) p) ∧
   (∀ p, obs.safe p ↔ plannerSafe (currentRoomState s) p)
+
+structure AgentFeedback where
+  -- Python reward 先缩放为整数，避免把浮点舍入放入证明可信基。
+  scaledReward : Int
+  inventory : Inventory
+  deriving DecidableEq, Repr
+
+def FeedbackRefinesWorld
+    (s : WorldState) (feedback : AgentFeedback) : Prop :=
+  feedback.inventory = s.player.inventory
 
 inductive TurnTarget where
   | chest | monster
@@ -2786,17 +2798,20 @@ theorem pixel_block_contains_only_intended_direction
 
 structure PolicyKernel (Controller : Type) where
   decide : Controller → VerifiedObservation → ControllerCommand
-  update : Controller → VerifiedObservation → WorldState → Controller
+  update : Controller → VerifiedObservation → AgentFeedback → Controller
 
 inductive ClosedLoopStep {Controller : Type} (policy : PolicyKernel Controller) :
     (Controller × WorldState) → Action → (Controller × WorldState) → Prop where
   | mk {controller nextController : Controller}
-      {world nextWorld : WorldState} {obs : VerifiedObservation}
+      {world nextWorld : WorldState}
+      {obs nextObs : VerifiedObservation} {feedback : AgentFeedback}
       (hobservation : ObservationRefinesWorld world obs)
       (hsafe : ControllerCommandSafe world (policy.decide controller obs))
       (htick : EngineTick world
         (commandAction (policy.decide controller obs)) nextWorld)
-      (hupdate : nextController = policy.update controller obs nextWorld) :
+      (hnextObservation : ObservationRefinesWorld nextWorld nextObs)
+      (hfeedback : FeedbackRefinesWorld nextWorld feedback)
+      (hupdate : nextController = policy.update controller nextObs feedback) :
       ClosedLoopStep policy (controller, world)
         (commandAction (policy.decide controller obs)) (nextController, nextWorld)
 
@@ -2818,7 +2833,7 @@ theorem closedLoopExec_projects_engineExec
   | nil state => exact EngineExec.nil
   | cons hstep hrest ih =>
       cases hstep with
-      | mk hobservation hsafe htick hupdate =>
+      | mk hobservation hsafe htick hnextObservation hfeedback hupdate =>
           exact EngineExec.cons htick ih
 
 theorem closedLoopExec_append
@@ -10659,7 +10674,7 @@ theorem policy_refines_agent
       action = commandAction (policy.decide controller observation) ∧
       EngineTick world action nextWorld := by
   cases h with
-  | mk hobservation hsafe htick hupdate =>
+  | mk hobservation hsafe htick hnextObservation hfeedback hupdate =>
       exact ⟨_, hobservation, hsafe, rfl, htick⟩
 
 theorem policy_complete_under_fairness
@@ -10763,7 +10778,7 @@ theorem policy_refines_agent
       action = commandAction (policy.decide controller observation) ∧
       EngineTick world action nextWorld := by
   cases h with
-  | mk hobservation hsafe htick hupdate =>
+  | mk hobservation hsafe htick hnextObservation hfeedback hupdate =>
       exact ⟨_, hobservation, hsafe, rfl, htick⟩
 
 theorem policy_complete_under_fairness
@@ -10823,7 +10838,7 @@ theorem policy_refines_agent
       action = commandAction (policy.decide controller observation) ∧
       EngineTick world action nextWorld := by
   cases h with
-  | mk hobservation hsafe htick hupdate =>
+  | mk hobservation hsafe htick hnextObservation hfeedback hupdate =>
       exact ⟨_, hobservation, hsafe, rfl, htick⟩
 
 theorem policy_complete_under_fairness
@@ -10876,7 +10891,7 @@ theorem policy_refines_agent
       action = commandAction (policy.decide controller observation) ∧
       EngineTick world action nextWorld := by
   cases h with
-  | mk hobservation hsafe htick hupdate =>
+  | mk hobservation hsafe htick hnextObservation hfeedback hupdate =>
       exact ⟨_, hobservation, hsafe, rfl, htick⟩
 
 theorem policy_complete_under_fairness
@@ -10929,7 +10944,7 @@ theorem policy_refines_agent
       action = commandAction (policy.decide controller observation) ∧
       EngineTick world action nextWorld := by
   cases h with
-  | mk hobservation hsafe htick hupdate =>
+  | mk hobservation hsafe htick hnextObservation hfeedback hupdate =>
       exact ⟨_, hobservation, hsafe, rfl, htick⟩
 
 theorem policy_complete_under_fairness
