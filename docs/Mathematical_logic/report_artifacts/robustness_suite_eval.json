@@ -18168,7 +18168,7 @@
       "task_id": "mathematical_logic/task_1"
     },
     "mathematical_logic/task_1 [original]": {
-      "avg_reward": 126.99000000000004,
+      "avg_reward": 126.98999999999997,
       "avg_steps": 291.0,
       "episodes": 60,
       "eval_stage": "original",
@@ -18205,7 +18205,7 @@
       "task_id": "mathematical_logic/task_1"
     },
     "mathematical_logic/task_1 [spatial]": {
-      "avg_reward": 128.13000000000002,
+      "avg_reward": 128.12999999999997,
       "avg_steps": 178.66666666666666,
       "episodes": 30,
       "eval_stage": "spatial",
@@ -18287,7 +18287,7 @@
       "task_id": "mathematical_logic/task_2"
     },
     "mathematical_logic/task_2 [original]": {
-      "avg_reward": 128.34999999999994,
+      "avg_reward": 128.35000000000014,
       "avg_steps": 165.0,
       "episodes": 60,
       "eval_stage": "original",
@@ -18326,7 +18326,7 @@
       "task_id": "mathematical_logic/task_2"
     },
     "mathematical_logic/task_2 [spatial]": {
-      "avg_reward": 127.60666666666657,
+      "avg_reward": 127.60666666666656,
       "avg_steps": 172.66666666666666,
       "episodes": 30,
       "eval_stage": "spatial",
@@ -18566,7 +18566,7 @@
       "task_id": "mathematical_logic/task_4"
     },
     "mathematical_logic/task_4 [original]": {
-      "avg_reward": 249.59999999999874,
+      "avg_reward": 249.59999999999857,
       "avg_steps": 1040.0,
       "episodes": 60,
       "eval_stage": "original",
@@ -18621,7 +18621,7 @@
       "task_id": "mathematical_logic/task_4"
     },
     "mathematical_logic/task_4 [spatial]": {
-      "avg_reward": 265.5899999999995,
+      "avg_reward": 265.5899999999994,
       "avg_steps": 1234.3333333333333,
       "episodes": 30,
       "eval_stage": "spatial",
@@ -18748,7 +18748,7 @@
       "task_id": "mathematical_logic/task_5"
     },
     "mathematical_logic/task_5 [original]": {
-      "avg_reward": 162.0400000000008,
+      "avg_reward": 162.04000000000084,
       "avg_steps": 1176.0,
       "episodes": 60,
       "eval_stage": "original",
@@ -18812,7 +18812,7 @@
       "task_id": "mathematical_logic/task_5"
     },
     "mathematical_logic/task_5 [spatial]": {
-      "avg_reward": 156.15333333333402,
+      "avg_reward": 156.153333333334,
       "avg_steps": 1141.3333333333333,
       "episodes": 30,
       "eval_stage": "spatial",
